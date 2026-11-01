@@ -96,6 +96,11 @@ with tempfile.TemporaryDirectory(prefix='cpa-queue-integration-') as temp:
     port = free_port()
     policy_file = root / 'policies.json'
     policy_file.write_text(json.dumps({'version': 1, 'defaults': {'max_concurrency': 1, 'max_queue': 3, 'wait_timeout_ms': 5000, 'paused': False}, 'accounts': {}}))
+    auths = root / 'auths'
+    auths.mkdir()
+    # Disabled dummy credential exercises account discovery without giving the
+    # host a real token or allowing any traffic to an external provider.
+    (auths / 'fixture-disabled.json').write_text(json.dumps({'type': 'claude', 'access_token': 'fixture-not-a-real-token', 'email': 'fixture@example.invalid', 'disabled': True}))
     config = {
         'config-version': 8,
         'server': {'host': '127.0.0.1', 'port': port, 'response-compression': {'enabled': False}},
@@ -136,11 +141,21 @@ with tempfile.TemporaryDirectory(prefix='cpa-queue-integration-') as temp:
     def chat(text, stream=False):
         return api('/v1/chat/completions', 'POST', {'model': 'queue-test', 'messages': [{'role': 'user', 'content': text}], 'stream': stream}, False)
 
+    def set_defaults(queue, wait_ms):
+        code, raw = api('/v0/management/plugins/cpa-account-queue/config')
+        assert code == 200
+        current = json.loads(raw)
+        current['config']['defaults']['max_queue'] = queue
+        current['config']['defaults']['wait_timeout_ms'] = wait_ms
+        code, raw = api('/v0/management/plugins/cpa-account-queue/config', 'PUT', current)
+        assert code == 200, (code, raw)
+
     try:
         wait_until(lambda: api('/v1/models', management=False)[0] == 200, 'CPA did not start')
         initial = status()
         print('HOST_INITIAL', json.dumps(initial))
         assert initial['account_index_available'], initial
+        assert any(a['name'] == 'fixture-disabled.json' for a in initial['account_index']), initial
         # Public resource must not disclose state; management routes require auth.
         req = urllib.request.Request(base + '/v0/management/plugins/cpa-account-queue/status')
         try:
@@ -183,7 +198,25 @@ with tempfile.TemporaryDirectory(prefix='cpa-queue-integration-') as temp:
             RELEASE.set()
             assert held.result(timeout=10)[0] == 200
         wait_until(lambda: all(a['in_flight'] == 0 for a in status()['runtime']['accounts']), 'cancellation fixture leaked slots')
-        print('Pinned CPA integration passed: actual loading, authenticated management, stream-held slot, FIFO, disconnected waiter cleanup, peak upstream concurrency=1')
+        # Capacity and timeout errors must not poison the whole plugin. Prove
+        # the first free slot accepts work again after each rejection.
+        for queue, wait_ms, label in [(0, 1000, 'full'), (2, 100, 'timeout')]:
+            set_defaults(queue, wait_ms)
+            RELEASE.clear()
+            before = len(ARRIVALS)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                held = pool.submit(chat, 'hold-' + label)
+                wait_until(lambda: len(ARRIVALS) == before + 1, 'rejection fixture did not start')
+                code, body = chat('rejected-' + label)
+                assert code == 503, (label, code, body)
+                assert len(ARRIVALS) == before + 1, 'rejected request reached provider'
+                wait_until(lambda: status()['runtime']['waiting'] == 0, 'rejected waiter leaked')
+                RELEASE.set()
+                assert held.result(timeout=10)[0] == 200
+            wait_until(lambda: all(a['in_flight'] == 0 for a in status()['runtime']['accounts']), 'post-rejection release stuck')
+            code, body = chat('after-' + label)
+            assert code == 200 and b'OK' in body, (label, code, body)
+        print('Pinned CPA integration passed: actual loading, authenticated management, stream-held slot, FIFO, disconnected waiter cleanup, queue-full/timeout rejection and recovery, peak upstream concurrency=1')
     except BaseException:
         logfile.flush()
         print('--- isolated CPA log ---')
