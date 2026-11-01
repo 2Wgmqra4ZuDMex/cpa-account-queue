@@ -3,8 +3,10 @@
 This is an independent implementation of a local account admission controller.
 No source code or release binaries from `tsunheimat/cpa-courrency-plugin` have
 been copied into this project. Its public design and the incident observed with
-v0.1.8 motivated the lifecycle regression tests. The production incident's root
-cause has **not** yet been reproduced or established.
+v0.1.8 motivated the lifecycle regression tests. A direct Windows ABI test now
+reproduces registration success followed by total rejection after shutdown with
+an active request. This is not yet proof of the production Linux incident's
+exact trigger; see TESTING.md.
 
 Reference reviewed: upstream commit
 `aa07db00a0bd5420936898f360f88a0ca79386bc`.
