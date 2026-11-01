@@ -219,12 +219,12 @@ func (r *runtime) management(in managementInput) ([]byte, error) {
 			}
 			return ""
 		}()})
-	case in.Method == "GET" && strings.HasSuffix(in.Path, managementBase+"/config"):
+	case in.Method == "GET" && strings.HasSuffix(in.Path, managementBase+"/policies"):
 		r.mu.Lock()
 		c := r.config.Clone()
 		r.mu.Unlock()
 		return managementJSON(200, map[string]any{"revision": revision(c), "config": c})
-	case in.Method == "PUT" && strings.HasSuffix(in.Path, managementBase+"/config"):
+	case in.Method == "PUT" && strings.HasSuffix(in.Path, managementBase+"/policies"):
 		var update struct {
 			Revision string          `json:"revision"`
 			Config   json.RawMessage `json:"config"`

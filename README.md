@@ -74,8 +74,10 @@ plugins:
 管理接口（CPA 负责管理鉴权）：
 
 - GET `/v0/management/plugins/cpa-account-queue/status`
-- GET `/v0/management/plugins/cpa-account-queue/config`
-- PUT `/v0/management/plugins/cpa-account-queue/config`
+- GET `/v0/management/plugins/cpa-account-queue/policies`
+- PUT `/v0/management/plugins/cpa-account-queue/policies`
+
+`/config` 是 CPA 的插件宿主保留接口，不能用于插件自定义策略。
 
 状态和配置包含账号标识，仅应向管理员开放。不要将 state 文件或真实账号配置提交到仓库。
 

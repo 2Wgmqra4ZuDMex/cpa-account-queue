@@ -78,7 +78,7 @@ func registration() any {
 
 func managementRegistration() any {
 	routes := []any{}
-	for _, r := range []struct{ method, path string }{{"GET", "/status"}, {"GET", "/config"}, {"PUT", "/config"}} {
+	for _, r := range []struct{ method, path string }{{"GET", "/status"}, {"GET", "/policies"}, {"PUT", "/policies"}} {
 		routes = append(routes, map[string]string{"Method": r.method, "Path": managementBase + r.path})
 	}
 	return map[string]any{"routes": routes, "resources": []any{map[string]string{"Path": "/ui", "Menu": "账号并发与排队", "Description": "逐账号并发、有限队列及运行状态"}}}

@@ -28,7 +28,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get('X-Management-Key') != 'fixture-key':
             self.answer(401, {'error': 'unauthorized'})
             return
-        if self.path.endswith('/config'):
+        if self.path.endswith('/policies'):
             self.answer(200, {'config': CONFIG, 'revision': str(REVISION)})
         elif self.path.endswith('/status'):
             accounts = []

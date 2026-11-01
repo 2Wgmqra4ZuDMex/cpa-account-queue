@@ -119,7 +119,7 @@ func TestSettingsPersistAndRejectStaleRevision(t *testing.T) {
 		Revision string           `json:"revision"`
 		Config   admission.Config `json:"config"`
 	} {
-		b, _ := r.management(managementInput{Method: http.MethodGet, Path: managementBase + "/config"})
+		b, _ := r.management(managementInput{Method: http.MethodGet, Path: managementBase + "/policies"})
 		out := decodeResult[managementOutput](t, b)
 		var data struct {
 			Revision string           `json:"revision"`
@@ -131,14 +131,14 @@ func TestSettingsPersistAndRejectStaleRevision(t *testing.T) {
 	data := read()
 	data.Config.Accounts["account"] = admission.Policy{MaxConcurrency: 5, MaxQueue: 9, WaitTimeoutMS: 30000}
 	body, _ := json.Marshal(data)
-	b, err := r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/config", Body: body})
+	b, err := r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/policies", Body: body})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out := decodeResult[managementOutput](t, b); out.StatusCode != 200 {
 		t.Fatalf("save: %s", out.Body)
 	}
-	b, _ = r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/config", Body: body})
+	b, _ = r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/policies", Body: body})
 	if out := decodeResult[managementOutput](t, b); out.StatusCode != 409 {
 		t.Fatal("stale write accepted")
 	}

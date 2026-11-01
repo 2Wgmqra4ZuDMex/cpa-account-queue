@@ -142,12 +142,12 @@ with tempfile.TemporaryDirectory(prefix='cpa-queue-integration-') as temp:
         return api('/v1/chat/completions', 'POST', {'model': 'queue-test', 'messages': [{'role': 'user', 'content': text}], 'stream': stream}, False)
 
     def set_defaults(queue, wait_ms):
-        code, raw = api('/v0/management/plugins/cpa-account-queue/config')
+        code, raw = api('/v0/management/plugins/cpa-account-queue/policies')
         assert code == 200
         current = json.loads(raw)
         current['config']['defaults']['max_queue'] = queue
         current['config']['defaults']['wait_timeout_ms'] = wait_ms
-        code, raw = api('/v0/management/plugins/cpa-account-queue/config', 'PUT', current)
+        code, raw = api('/v0/management/plugins/cpa-account-queue/policies', 'PUT', current)
         assert code == 200, (code, raw)
 
     try:

@@ -298,3 +298,64 @@ func TestStoreRoundTripAndValidation(t *testing.T) {
 		t.Fatal("accepted unknown fields")
 	}
 }
+
+func TestIndependentAccountOverridesAndInheritance(t *testing.T) {
+	c := DefaultConfig()
+	c.Defaults = Policy{MaxConcurrency: 2, MaxQueue: 0, WaitTimeoutMS: 100}
+	c.Accounts["a"] = Policy{MaxConcurrency: 1, MaxQueue: 0, WaitTimeoutMS: 100}
+	c.Accounts["b"] = Policy{MaxConcurrency: 3, MaxQueue: 0, WaitTimeoutMS: 100}
+	e, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, limit := range map[string]int{"a": 1, "b": 3, "inherits": 2} {
+		for i := 0; i < limit; i++ {
+			mustAcquire(t, e, fmt.Sprintf("%s-%d", id, i), id)
+		}
+		if err := e.Acquire(context.Background(), id+"-overflow", id); !errors.Is(err, ErrQueueFull) {
+			t.Fatalf("%s: %v", id, err)
+		}
+	}
+}
+
+func TestConcurrentDuplicateWaitersOnlyConsumeOneSlot(t *testing.T) {
+	e := engine(t, 1, 3, 1000)
+	mustAcquire(t, e, "active", "a")
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { results <- e.Acquire(context.Background(), "same", "a") }()
+	}
+	waitQueued(t, e, 1)
+	e.Complete("active")
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := e.Snapshot(nil)
+	if s.Accounts[0].InFlight != 1 || s.Waiting != 0 {
+		t.Fatal(s)
+	}
+	e.Complete("same")
+}
+
+func TestDrainRejectsQueuedRequestsWithoutReleasingActive(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	mustAcquire(t, e, "active", "a")
+	result := make(chan error, 1)
+	go func() { result <- e.Acquire(context.Background(), "wait", "a") }()
+	waitQueued(t, e, 1)
+	e.BeginDrain()
+	if err := <-result; !errors.Is(err, ErrDraining) {
+		t.Fatal(err)
+	}
+	s := e.Snapshot(nil)
+	if !s.Draining || s.Waiting != 0 || s.Accounts[0].InFlight != 1 {
+		t.Fatal(s)
+	}
+	e.Complete("active")
+	if err := e.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	mustAcquire(t, e, "new", "a")
+}
