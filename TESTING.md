@@ -68,3 +68,35 @@ https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/actions/runs/41298025070
 - 空闲启停的完整管理操作回归；活动请求时严禁热替换，宿主可能移除完成回调。
 - 真实生产容器的 libc/动态库兼容性；CI 二进制不能未经验证直接视为可部署。
 - 产品级发布打包、安装说明及回退演练。
+
+## 生产服务器上的隔离容器验收（2026-11-01）
+
+经用户授权，仅创建独立测试资源，没有将插件安装进生产 CPA。
+
+- 1Panel 编排：`cpa-account-queue-test`，来源 `1Panel`，两个容器。
+- 镜像复用生产固定 image ID：`sha256:20925aef8323b3f2539605aa048bb59ff17cc9761cba311e2eb1e1723b1ff42e`。
+- 实际宿主版本已是 **v8.0.49 / 250d598**；没有进行生产升级。
+- Debian 12，glibc 2.36，amd64；GitHub CI 动态库成功加载。
+- 测试插件 SHA256：`41568d18f73ed01e8af9b546b5817b113c2889d31c8d002f949ed9b7c146f180`。
+- 测试目录独立；无生产 auth/config/plugin 挂载；Docker 网络 `internal: true`，没有接入 `app`。
+- 每容器限制 0.5 CPU / 384 MiB / 128 PIDs，restart=no，关闭 Watchtower 更新。
+- 仅配置 loopback 发布端口。内部网络未提供预期的 loopback NAT，第一次访问失败后测试容器已自动停止；第二次改由宿主机直接访问测试专用桥接 IP，未更改防火墙或网络隔离。
+- 模拟上游为本项目 `tests/serverfixture` 静态程序，假账号、假密钥，无真实模型调用。
+
+最终通过：
+
+1. 动态库加载、假凭证列表、管理未授权拒绝、管理 UI HTTP 200。
+2. 并发 1 下 FIFO 顺序为 first / second / third，流式占位正确。
+3. 账号 A 上限 1，账号 B 上限 2，实测峰值分别 1 / 2；各账号独立排队。
+4. 账号配置经真实管理 API 保存到独立策略文件。
+5. 排队客户端断开后约 305 ms 清理，未进入模拟上游。
+6. 队列满 / 等待超时均返回 503；释放后新请求返回 200。
+7. 暂停 A 时 B 仍可使用；恢复 A 后请求正常。
+8. 仅重启测试 CPA 容器，账号策略保留，首请求正常。
+
+结束状态：两个测试容器均 `exited`，未删除，便于在 1Panel 查看。
+生产容器 ID、启动时间、重启次数与测试前一致；生产 CPA config、ai-api 网站和反代、mibao 网站主配置 SHA256 一致。
+
+原始记录保存在服务器独立测试目录的 `result.json`、`test-host.log`、`baseline.json`；
+本地副本在忽略提交的 `dist/server-test/`。
+剩余边界：真实 OAuth 凭证执行映射、真实宿主管理 UI 的浏览器操作、插件级空闲禁用/重新启用及生产安装回退仍需验收。
