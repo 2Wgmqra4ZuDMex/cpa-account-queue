@@ -1,0 +1,44 @@
+name: Test and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify modules and formatting
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(gofmt -l internal cmd)"
+          go mod verify
+      - name: Race tests
+        run: go test -race -count=3 -timeout 120s ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build native library
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cpa-account-queue.so ./cmd/plugin
+          sha256sum dist/cpa-account-queue.so > dist/checksums.txt
+      - name: Native ABI smoke test
+        run: python3 tests/native_smoke.py dist/cpa-account-queue.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-account-queue-linux-amd64-dev
+          path: |
+            dist/cpa-account-queue.so
+            dist/checksums.txt

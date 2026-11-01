@@ -1,0 +1,9 @@
+/dist/
+/state/
+*.so
+*.dll
+*.dylib
+*.exe
+*.test
+coverage.out
+.env
