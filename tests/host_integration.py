@@ -164,7 +164,26 @@ with tempfile.TemporaryDirectory(prefix='cpa-queue-integration-') as temp:
         wait_until(lambda: all(a['in_flight'] == 0 and a['queued'] == 0 for a in status()['runtime']['accounts']), 'slots did not release')
         assert PEAK == 1, ('upstream oversubscribed', PEAK)
         assert ARRIVALS == ['hold-first', 'second', 'third'], ARRIVALS
-        print('Pinned CPA integration passed: actual loading, authenticated management, stream-held slot, FIFO, peak upstream concurrency=1')
+        # A client closes its HTTP socket while still queued. CPA must deliver
+        # terminal notification promptly, not after the active slot is freed.
+        RELEASE.clear()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            held = pool.submit(chat, 'hold-cancellation')
+            wait_until(lambda: len(ARRIVALS) == 4, 'cancellation fixture did not start')
+            payload = json.dumps({'model': 'queue-test', 'messages': [{'role': 'user', 'content': 'canceled-waiter'}]}).encode()
+            sock = socket.create_connection(('127.0.0.1', port), timeout=3)
+            raw = (f'POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer fixture-client-key\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n').encode() + payload
+            sock.sendall(raw)
+            wait_until(lambda: status()['runtime']['waiting'] == 1, 'cancel fixture did not queue')
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+            wait_until(lambda: status()['runtime']['waiting'] == 0, 'disconnected waiter retained in queue', timeout=2)
+            with LOCK:
+                assert 'canceled-waiter' not in ARRIVALS, ARRIVALS
+            RELEASE.set()
+            assert held.result(timeout=10)[0] == 200
+        wait_until(lambda: all(a['in_flight'] == 0 for a in status()['runtime']['accounts']), 'cancellation fixture leaked slots')
+        print('Pinned CPA integration passed: actual loading, authenticated management, stream-held slot, FIFO, disconnected waiter cleanup, peak upstream concurrency=1')
     except BaseException:
         logfile.flush()
         print('--- isolated CPA log ---')
