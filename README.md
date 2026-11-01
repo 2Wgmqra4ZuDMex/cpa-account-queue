@@ -2,6 +2,17 @@
 
 本地模式的 CPA 上游账号并发与有限排队插件。**开发预览，尚未获准生产部署。**
 
+## Web 安装
+
+公开自定义插件源（Linux amd64，开发预览）：
+
+```text
+https://raw.githubusercontent.com/2Wgmqra4ZuDMex/cpa-account-queue/main/registry.json
+```
+
+安装步骤、默认限额和版本固定方式见 [WEB-INSTALL.md](WEB-INSTALL.md)。
+此源不属于 CPA 官方商店；安装不代表已完成真实账号生产验收。
+
 ## 已实现的设计
 
 - 每个上游凭证账号独立设置并发、队列容量、等待超时、暂停接单。

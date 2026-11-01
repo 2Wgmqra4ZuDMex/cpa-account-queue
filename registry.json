@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "plugins": [
+    {
+      "id": "cpa-account-queue",
+      "name": "CPA Account Queue (Development Preview)",
+      "description": "Local per-account concurrency and bounded FIFO queues. Development preview; drain requests before replacing. Linux amd64 only.",
+      "author": "2Wgmqra4ZuDMex",
+      "version": "0.1.0-dev",
+      "repository": "https://github.com/2Wgmqra4ZuDMex/cpa-account-queue",
+      "homepage": "https://github.com/2Wgmqra4ZuDMex/cpa-account-queue",
+      "license": "MIT",
+      "tags": ["concurrency", "queue", "local", "preview"],
+      "install": {
+        "type": "direct",
+        "artifacts": [
+          {
+            "goos": "linux",
+            "goarch": "amd64",
+            "url": "https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.0-dev/cpa-account-queue_0.1.0-dev_linux_amd64.zip",
+            "sha256": "a7f1f7804c8d6dcb6a5ff37d49fce71ea93e22a1f08574ecbde6d895562c50f2",
+            "size": 3721833
+          }
+        ]
+      }
+    }
+  ]
+}
