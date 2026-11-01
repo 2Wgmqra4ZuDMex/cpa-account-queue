@@ -23,7 +23,9 @@ https://raw.githubusercontent.com/2Wgmqra4ZuDMex/cpa-account-queue/main/registry
 - 不在响应开始时释放流式请求，不按固定 TTL 清空正在执行的请求。
 - 管理页面编辑配置，持久化保存，revision 防止覆盖其他页面的更新。
 - 静态公开资源不包含账号信息；管理 API 由 CPA 管理鉴权保护。
-- 管理密钥仅保存在页面内存，无 localStorage/sessionStorage。
+- 管理密钥默认仅在页面内存；可勾选“记住本次会话”使用 sessionStorage，刷新后自动连接；清除密钥或鉴权失败会移除会话密钥，不使用 localStorage。
+- 页面跟随同源 CPA 主面板的主题变量和主题切换；独立打开时使用官方配色并跟随系统明暗。
+- 默认每 5 秒自动刷新，间隔可设 1–300 秒或关闭；刷新不覆盖未保存的策略编辑，隐藏页面暂停轮询。
 - 独立插件 ID：`cpa-account-queue`。不注册响应块拦截。
 
 ## 状态与限制

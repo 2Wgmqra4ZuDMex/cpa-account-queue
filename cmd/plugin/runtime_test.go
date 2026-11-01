@@ -158,7 +158,7 @@ func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 	if out.StatusCode != 200 {
 		t.Fatal(out.StatusCode)
 	}
-	for _, forbidden := range []string{"localStorage", "sessionStorage", "innerHTML", "account-secret", "access_token"} {
+	for _, forbidden := range []string{"localStorage", "innerHTML", "account-secret", "access_token"} {
 		if strings.Contains(string(out.Body), forbidden) {
 			t.Fatal(forbidden)
 		}

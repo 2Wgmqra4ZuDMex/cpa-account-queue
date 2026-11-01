@@ -29,6 +29,12 @@ jobs:
         run: go test -race -count=3 -timeout 120s ./...
       - name: Vet
         run: go vet ./...
+      - name: Browser UI acceptance
+        run: |
+          python3 -m venv /tmp/queue-ui-venv
+          /tmp/queue-ui-venv/bin/pip install playwright==1.64.1
+          /tmp/queue-ui-venv/bin/playwright install --with-deps chromium
+          /tmp/queue-ui-venv/bin/python tests/ui_browser.py
       - name: Build native library
         run: |
           mkdir -p dist
