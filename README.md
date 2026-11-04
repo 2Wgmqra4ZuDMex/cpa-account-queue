@@ -22,6 +22,7 @@ https://raw.githubusercontent.com/2Wgmqra4ZuDMex/cpa-account-queue/main/registry
 - 请求完成、失败或取消通过 `request.complete` 释放占用。
 - 不在响应开始时释放流式请求，不按固定 TTL 清空正在执行的请求。
 - 管理页面编辑配置，持久化保存，revision 防止覆盖其他页面的更新。
+- 账号名称旁显示 CPA 凭据平台标签（例如 Antigravity、Claude、Kimi）；同邮箱账号可按平台区分，缺少平台元数据时显示“未知平台”，不按邮箱或模型名猜测。
 - 静态公开资源不包含账号信息；管理 API 由 CPA 管理鉴权保护。
 - 管理密钥默认仅在页面内存；可勾选“记住本次会话”使用 sessionStorage，刷新后自动连接；清除密钥或鉴权失败会移除会话密钥，不使用 localStorage。
 - 页面跟随同源 CPA 主面板的主题变量和主题切换；独立打开时使用官方配色并跟随系统明暗。

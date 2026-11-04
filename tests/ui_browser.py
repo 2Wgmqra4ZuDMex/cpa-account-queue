@@ -11,6 +11,7 @@ config = {'version': 1, 'defaults': policy, 'accounts': {}}
 hits = []
 reject = False
 value = 0
+providers = [('a', 'Antigravity', 'antigravity'), ('b', 'Claude', 'claude'), ('c', 'Kimi', 'kimi'), ('d', 'custom-provider', 'custom-provider'), ('e', '未知平台', '')]
 
 
 def route(req):
@@ -31,7 +32,7 @@ def route(req):
         req.fulfill(json={'revision': 'fixture-revision', 'config': config})
     else:
         value += 1
-        req.fulfill(json={'runtime': {'draining': False, 'waiting': value, 'global_queue_limit': 1024, 'accounts': [{'id': 'a', 'policy': config['accounts'].get('a', policy), 'in_flight': 1, 'queued': value, 'oldest_wait_ms': 1000}]}, 'account_index_available': True, 'account_index': [{'id': 'a', 'name': 'Account A'}]})
+        req.fulfill(json={'runtime': {'draining': False, 'waiting': value, 'global_queue_limit': 1024, 'accounts': [{'id': aid, 'policy': config['accounts'].get(aid, policy), 'in_flight': 1, 'queued': value, 'oldest_wait_ms': 1000} for aid, _, _ in providers]}, 'account_index_available': True, 'account_index': [{'id': aid, 'name': 'Account A' if aid == 'a' else 'same-email@example.invalid', 'provider': provider} for aid, _, provider in providers]})
 
 
 with sync_playwright() as p:
@@ -52,6 +53,7 @@ with sync_playwright() as p:
     frame.locator('#remember').check()
     frame.locator('#connect').click()
     expect(frame.locator('#status')).to_contain_text('已连接')
+    expect(frame.locator('.provider-badge')).to_have_text([label for _, label, _ in providers])
     frame.locator('#interval').fill('1')
     frame.locator('#interval').press('Tab')
     frame.locator('input[aria-label="为 Account A 使用独立策略"]').check()
