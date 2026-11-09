@@ -37,16 +37,18 @@ const maxEvents = 256
 // no request or credential identifiers and are reset when the CPA process
 // restarts.
 type Counters struct {
-	Enqueued         uint64 `json:"enqueued"`
-	Admitted         uint64 `json:"admitted"`
-	Completed        uint64 `json:"completed"`
-	Cancelled        uint64 `json:"cancelled"`
-	TimedOut         uint64 `json:"timed_out"`
-	QueueFull        uint64 `json:"queue_full"`
-	GlobalQueueFull  uint64 `json:"global_queue_full"`
-	PausedRejected   uint64 `json:"paused_rejected"`
-	DrainingRejected uint64 `json:"draining_rejected"`
-	OrphanedComplete uint64 `json:"orphaned_complete"`
+	Enqueued          uint64 `json:"enqueued"`
+	Admitted          uint64 `json:"admitted"`
+	Completed         uint64 `json:"completed"`
+	Cancelled         uint64 `json:"cancelled"`
+	TimedOut          uint64 `json:"timed_out"`
+	QueueFull         uint64 `json:"queue_full"`
+	GlobalQueueFull   uint64 `json:"global_queue_full"`
+	PausedRejected    uint64 `json:"paused_rejected"`
+	DrainingRejected  uint64 `json:"draining_rejected"`
+	OrphanedComplete  uint64 `json:"orphaned_complete"`
+	PinnedAccountFull uint64 `json:"pinned_account_full"`
+	AffinityFallback  uint64 `json:"affinity_fallback"`
 }
 
 // Event is a redacted lifecycle event retained in the in-memory ring buffer.
@@ -528,33 +530,68 @@ func (e *Engine) Choose(ids []string, pinned string) (string, error) {
 	if e.draining {
 		return "", ErrDraining
 	}
-	best := ""
-	bestScore := int(^uint(0) >> 1)
-	for _, id := range ids {
-		if pinned != "" && id != pinned {
-			continue
-		}
-		p := e.cfg.Policy(id)
-		if p.Paused {
-			continue
-		}
-		a := e.accounts[id]
-		active, queued := 0, 0
-		if a != nil {
-			active = a.active
-			queued = len(a.queue)
-		}
-		score := active * 1000 / p.MaxConcurrency
-		if active >= p.MaxConcurrency || queued > 0 {
-			if queued >= p.MaxQueue {
+	choose := func(candidates []string) (string, int) {
+		best := ""
+		bestScore := int(^uint(0) >> 1)
+		for _, id := range candidates {
+			p := e.cfg.Policy(id)
+			if p.Paused {
 				continue
 			}
-			score = 1000000 + (queued+1)*1000/p.MaxConcurrency
+			a := e.accounts[id]
+			active, queued := 0, 0
+			if a != nil {
+				active = a.active
+				queued = len(a.queue)
+			}
+			score := active * 1000 / p.MaxConcurrency
+			if active >= p.MaxConcurrency || queued > 0 {
+				if queued >= p.MaxQueue {
+					continue
+				}
+				score = 1000000 + (queued+1)*1000/p.MaxConcurrency
+			}
+			if score < bestScore {
+				best, bestScore = id, score
+			}
 		}
-		if score < bestScore {
-			best, bestScore = id, score
-		}
+		return best, bestScore
 	}
+	if pinned != "" && e.cfg.PinnedFullBehavior == "fallback" {
+		p := e.cfg.Policy(pinned)
+		a := e.accounts[pinned]
+		active, queued := 0, 0
+		if a != nil {
+			active, queued = a.active, len(a.queue)
+		}
+		if !p.Paused && active < p.MaxConcurrency && queued == 0 {
+			return pinned, nil
+		}
+		e.counters.PinnedAccountFull++
+		e.recordLocked("pinned_account_full", "", pinned, 0, "pinned account is full; trying fallback candidates")
+		others := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if id != pinned {
+				others = append(others, id)
+			}
+		}
+		if best, _ := choose(others); best != "" {
+			e.counters.AffinityFallback++
+			e.recordLocked("affinity_fallback", "", best, 0, "selected fallback for full pinned account")
+			return best, nil
+		}
+		// No fallback is currently usable; retain the pinned account so Acquire
+		// can preserve its FIFO/timeout behavior when queue capacity remains.
+		if !p.Paused && queued < p.MaxQueue {
+			return pinned, nil
+		}
+		return "", ErrQueueFull
+	}
+	candidates := ids
+	if pinned != "" {
+		candidates = []string{pinned}
+	}
+	best, _ := choose(candidates)
 	if best == "" {
 		return "", ErrQueueFull
 	}

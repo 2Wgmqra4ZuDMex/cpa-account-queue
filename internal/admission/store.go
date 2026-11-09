@@ -44,7 +44,14 @@ func Load(path string, fallback Config) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return DecodeConfig(raw)
+	c, err := DecodeConfig(raw)
+	if err != nil {
+		return Config{}, err
+	}
+	if c.PinnedFullBehavior == "" {
+		c.PinnedFullBehavior = fallback.PinnedFullBehavior
+	}
+	return c, nil
 }
 
 // Save commits one validated configuration using a same-directory temporary

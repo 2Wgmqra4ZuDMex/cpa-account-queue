@@ -268,6 +268,42 @@ func TestSchedulerQueuesFullAccountAndHonorsPin(t *testing.T) {
 	}
 }
 
+func TestSchedulerPinnedFullFallback(t *testing.T) {
+	c := DefaultConfig()
+	c.PinnedFullBehavior = "fallback"
+	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 1, WaitTimeoutMS: 1000}
+	c.Accounts["prolite"] = Policy{MaxConcurrency: 3, MaxQueue: 3, WaitTimeoutMS: 1000}
+	e, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAcquire(t, e, "active", "team")
+	if id, err := e.Choose([]string{"team", "prolite"}, "team"); err != nil || id != "prolite" {
+		t.Fatalf("fallback=%s err=%v", id, err)
+	}
+	s := e.Snapshot([]string{"team", "prolite"})
+	if s.Counters.PinnedAccountFull != 1 || s.Counters.AffinityFallback != 1 {
+		t.Fatalf("unexpected fallback diagnostics: %+v", s.Counters)
+	}
+	if len(s.RecentEvents) != 3 || s.RecentEvents[2].Kind != "affinity_fallback" {
+		t.Fatalf("unexpected fallback events: %+v", s.RecentEvents)
+	}
+}
+
+func TestSchedulerPinnedFullFallbackQueuesWhenNoAlternative(t *testing.T) {
+	c := DefaultConfig()
+	c.PinnedFullBehavior = "fallback"
+	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 1, WaitTimeoutMS: 1000}
+	e, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAcquire(t, e, "active", "team")
+	if id, err := e.Choose([]string{"team"}, "team"); err != nil || id != "team" {
+		t.Fatalf("pinned queue=%s err=%v", id, err)
+	}
+}
+
 func TestConcurrentAccounting(t *testing.T) {
 	e := engine(t, 3, 200, 10000)
 	var running, peak atomic.Int32

@@ -148,6 +148,28 @@ func TestSettingsPersistAndRejectStaleRevision(t *testing.T) {
 	}
 }
 
+func TestPinnedFullBehaviorConfigRoundTrip(t *testing.T) {
+	r := setupRuntime(t)
+	b, _ := r.management(managementInput{Method: http.MethodGet, Path: managementBase + "/policies"})
+	out := decodeResult[managementOutput](t, b)
+	var data struct {
+		Revision string           `json:"revision"`
+		Config   admission.Config `json:"config"`
+	}
+	if err := json.Unmarshal(out.Body, &data); err != nil {
+		t.Fatal(err)
+	}
+	data.Config.PinnedFullBehavior = "fallback"
+	body, _ := json.Marshal(data)
+	b, err := r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/policies", Body: body})
+	if err != nil || decodeResult[managementOutput](t, b).StatusCode != 200 {
+		t.Fatalf("save fallback: %v %s", err, b)
+	}
+	if r.config.PinnedFullBehavior != "fallback" {
+		t.Fatalf("runtime config=%q", r.config.PinnedFullBehavior)
+	}
+}
+
 func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 	r := setupRuntime(t)
 	b, err := r.management(managementInput{Method: http.MethodGet, Path: "/v0/resource/plugins/cpa-account-queue/ui"})

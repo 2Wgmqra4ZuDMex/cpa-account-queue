@@ -36,8 +36,9 @@ func (r *runtime) configure(raw []byte) error {
 		return fmt.Errorf("CPA schema 7 or newer is required (metadata-only admission)")
 	}
 	cfg := struct {
-		StatePath string            `yaml:"state_path"`
-		Defaults  *admission.Policy `yaml:"defaults"`
+		StatePath          string            `yaml:"state_path"`
+		Defaults           *admission.Policy `yaml:"defaults"`
+		PinnedFullBehavior string            `yaml:"pinned_full_behavior"`
 	}{StatePath: "plugins/state/cpa-account-queue/policies.json"}
 	if err := yaml.Unmarshal(in.ConfigYAML, &cfg); err != nil {
 		return err
@@ -48,6 +49,9 @@ func (r *runtime) configure(raw []byte) error {
 	fallback := admission.DefaultConfig()
 	if cfg.Defaults != nil {
 		fallback.Defaults = *cfg.Defaults
+	}
+	if cfg.PinnedFullBehavior != "" {
+		fallback.PinnedFullBehavior = cfg.PinnedFullBehavior
 	}
 	path, err := filepath.Abs(cfg.StatePath)
 	if err != nil {
@@ -241,6 +245,12 @@ func (r *runtime) management(in managementInput) ([]byte, error) {
 		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		if c.PinnedFullBehavior == "" {
+			c.PinnedFullBehavior = r.config.PinnedFullBehavior
+			if c.PinnedFullBehavior == "" {
+				c.PinnedFullBehavior = "queue"
+			}
+		}
 		if update.Revision != revision(r.config) {
 			return managementJSON(409, map[string]string{"error": "configuration changed; reload before saving"})
 		}

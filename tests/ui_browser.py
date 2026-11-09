@@ -32,7 +32,7 @@ def route(req):
         req.fulfill(json={'revision': 'fixture-revision', 'config': config})
     else:
         value += 1
-        req.fulfill(json={'runtime': {'draining': False, 'waiting': value, 'global_queue_limit': 1024, 'accounts': [{'id': aid, 'policy': config['accounts'].get(aid, policy), 'in_flight': 1, 'queued': value, 'oldest_wait_ms': 1000} for aid, _, _ in providers]}, 'account_index_available': True, 'account_index': [{'id': aid, 'name': 'Account A' if aid == 'a' else 'same-email@example.invalid', 'provider': provider} for aid, _, provider in providers]})
+        req.fulfill(json={'runtime': {'draining': False, 'waiting': value, 'global_queue_limit': 1024, 'accounts': [{'id': aid, 'policy': config['accounts'].get(aid, policy), 'in_flight': 1, 'queued': value, 'oldest_wait_ms': 1000} for aid, _, _ in providers], 'counters': {'enqueued': 0, 'admitted': 0, 'completed': 0, 'cancelled': 0, 'timed_out': 0, 'queue_full': 0, 'global_queue_full': 0, 'paused_rejected': 0, 'draining_rejected': 0, 'orphaned_complete': 0, 'pinned_account_full': 0, 'affinity_fallback': 0}, 'recent_events': []}, 'account_index_available': True, 'account_index': [{'id': aid, 'name': 'Account A' if aid == 'a' else ('same-email@example.invalid' if aid in ('b', 'c') else 'other@example.invalid'), 'provider': provider} for aid, _, provider in providers]})
 
 
 with sync_playwright() as p:
@@ -53,7 +53,12 @@ with sync_playwright() as p:
     frame.locator('#remember').check()
     frame.locator('#connect').click()
     expect(frame.locator('#status')).to_contain_text('已连接')
-    expect(frame.locator('.provider-badge')).to_have_text([label for _, label, _ in providers])
+    expect(frame.locator('.provider-badge')).to_have_text([providers[i][1] for i in (0, 3, 4, 1, 2)])
+    expect(frame.locator('#pinned-full-behavior')).to_have_value('queue')
+    frame.locator('#pinned-full-behavior').select_option('fallback')
+    frame.locator('#save').click()
+    expect(frame.locator('#draft-note')).to_contain_text('已保存')
+    assert config['pinned_full_behavior'] == 'fallback'
     frame.locator('#interval').fill('1')
     frame.locator('#interval').press('Tab')
     frame.locator('input[aria-label="为 Account A 使用独立策略"]').check()

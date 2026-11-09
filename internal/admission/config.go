@@ -15,13 +15,14 @@ type Policy struct {
 }
 
 type Config struct {
-	Version  int               `json:"version" yaml:"version"`
-	Defaults Policy            `json:"defaults" yaml:"defaults"`
-	Accounts map[string]Policy `json:"accounts" yaml:"accounts"`
+	Version            int               `json:"version" yaml:"version"`
+	Defaults           Policy            `json:"defaults" yaml:"defaults"`
+	Accounts           map[string]Policy `json:"accounts" yaml:"accounts"`
+	PinnedFullBehavior string            `json:"pinned_full_behavior" yaml:"pinned_full_behavior"`
 }
 
 func DefaultConfig() Config {
-	return Config{Version: 1, Defaults: Policy{MaxConcurrency: 2, MaxQueue: 20, WaitTimeoutMS: 60000}, Accounts: map[string]Policy{}}
+	return Config{Version: 1, Defaults: Policy{MaxConcurrency: 2, MaxQueue: 20, WaitTimeoutMS: 60000}, Accounts: map[string]Policy{}, PinnedFullBehavior: "queue"}
 }
 
 func (p Policy) Validate() error {
@@ -41,6 +42,9 @@ func (c Config) Validate() error {
 	if c.Version != 1 {
 		return fmt.Errorf("unsupported configuration version")
 	}
+	if c.PinnedFullBehavior != "" && c.PinnedFullBehavior != "queue" && c.PinnedFullBehavior != "fallback" {
+		return fmt.Errorf("pinned_full_behavior must be queue or fallback")
+	}
 	if err := c.Defaults.Validate(); err != nil {
 		return fmt.Errorf("defaults: %w", err)
 	}
@@ -59,6 +63,9 @@ func (c Config) Validate() error {
 }
 
 func (c Config) Clone() Config {
+	if c.PinnedFullBehavior == "" {
+		c.PinnedFullBehavior = "queue"
+	}
 	n := c
 	n.Accounts = make(map[string]Policy, len(c.Accounts))
 	for k, v := range c.Accounts {

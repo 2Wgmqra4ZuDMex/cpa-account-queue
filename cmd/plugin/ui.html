@@ -10,7 +10,7 @@
 <header><div><h1>账号并发与排队</h1><p>每个上游账号，独立限额。执行与等待分开计数。</p></div><span class="muted">本地模式 · 开发预览</span></header>
 <section><form class="auth" id="auth"><label for="key">CPA 管理密钥<input type="password" id="key" autocomplete="off" required></label><label class="check"><input type="checkbox" id="remember">记住本次会话</label><button id="connect">连接并读取</button><button type="button" id="disconnect">清除密钥</button></form><p id="session-note" class="muted">勾选后刷新或重新进入本标签页无需重复输入；密钥仅存于本次浏览器会话，可随时清除。</p></section>
 <div id="status" class="status" role="status" aria-live="polite">输入管理密钥后读取账号。尚未连接。</div>
-<section><h2>默认策略</h2><div class="defaults" id="defaults"></div><p class="muted">未设置独立策略的账号继承默认值。暂停接单不打断正在执行的请求。</p></section>
+ <section><h2>默认策略</h2><div class="defaults" id="defaults"></div><p class="muted">未设置独立策略的账号继承默认值。暂停接单不打断正在执行的请求。</p><label class="behavior"><span>固定账号满载时</span><select id="pinned-full-behavior" aria-label="固定账号满载时"><option value="queue">继续在固定账号排队</option><option value="fallback">回退到其他可用账号</option></select></label></section>
 <section><div class="toolbar"><h2 style="margin:0">上游账号</h2><label class="check"><input type="checkbox" id="auto" checked>自动刷新</label><label class="interval" for="interval">间隔<input id="interval" type="number" min="1" max="300" step="1" value="5">秒</label><button id="refresh" type="button">立即刷新</button><span id="updated" class="muted"></span></div><p id="runtime" class="muted"></p>
  <div class="table-wrap"><table><thead><tr><th>账号</th><th>执行中</th><th>排队中</th><th>最久等待</th><th>独立策略</th><th>并发上限</th><th>排队上限</th><th>等待秒数</th><th>暂停</th></tr></thead><tbody id="accounts"><tr><td colspan="9" class="empty">尚未读取账号。</td></tr></tbody></table></div>
  <div class="footer"><span id="draft-note" class="muted">自动刷新仅更新运行状态，不覆盖策略编辑。</span><button id="save" type="button" disabled>保存策略</button></div></section>
@@ -61,8 +61,8 @@ function failed(error){if(error.status===401||error.status===403){connected=fals
 function number(value,min,max,label){const input=document.createElement('input');input.type='number';input.value=value;input.min=min;input.max=max;input.step=1;input.setAttribute('aria-label',label);input.addEventListener('input',markDirty);return input}
 function policyFields(p,prefix){return[number(p.max_concurrency,1,1000,prefix+'并发上限'),number(p.max_queue,0,1000,prefix+'排队上限'),number(p.wait_timeout_ms/1000,.001,600,prefix+'等待秒数')].map((x,i)=>{if(i===2)x.step='.001';return x})}
 function readFields(fields,paused){const[c,q,w]=fields.map(x=>Number(x.value));if(fields.some(x=>!x.checkValidity())||!Number.isInteger(c)||!Number.isInteger(q))throw Error('请检查限额与等待时间。');return{max_concurrency:c,max_queue:q,wait_timeout_ms:Math.round(w*1000),paused}}
-function renderEditor(){
- defaultFields=policyFields(config.defaults,'默认');$('defaults').replaceChildren();['并发上限','排队上限','最长等待（秒）'].forEach((text,i)=>{const l=document.createElement('label');l.textContent=text;l.append(defaultFields[i]);$('defaults').append(l)});
+ function renderEditor(){
+  defaultFields=policyFields(config.defaults,'默认');$('defaults').replaceChildren();['并发上限','排队上限','最长等待（秒）'].forEach((text,i)=>{const l=document.createElement('label');l.textContent=text;l.append(defaultFields[i]);$('defaults').append(l)});$('pinned-full-behavior').value=config.pinned_full_behavior||'queue';$('pinned-full-behavior').onchange=markDirty;
  const pause=document.createElement('input');pause.type='checkbox';pause.checked=config.defaults.paused;pause.id='default-pause';pause.setAttribute('aria-label','暂停默认账号');pause.onchange=markDirty;const l=document.createElement('label');l.textContent='暂停默认账号';l.append(pause);$('defaults').append(l);
  rows=new Map();$('accounts').replaceChildren();renderStatus();$('save').disabled=false;
 }
@@ -86,11 +86,15 @@ function makeRow(a,info){
   const counters=snapshot.runtime.counters||{},box=$('diagnostic-counters');box.replaceChildren();Object.keys(counterLabels).forEach(key=>{const item=document.createElement('span');item.className='diagnostic-counter';item.textContent=counterLabels[key]+': '+(counters[key]||0);box.append(item)});
   const body=$('events');body.replaceChildren();const events=snapshot.runtime.recent_events||[];if(!events.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=8;td.className='empty';td.textContent='暂无事件。';tr.append(td);body.append(tr);return}for(const event of events.slice().reverse()){const tr=document.createElement('tr');const values=[new Date(event.at).toLocaleString(),event.kind,event.account_tag||'—',event.request_tag||'—',event.wait_ms?event.wait_ms+' ms':'—',String(event.in_flight),String(event.queued),event.detail||''];for(const value of values){const td=document.createElement('td');td.textContent=value;tr.append(td)}body.append(tr)}
  }
+ function accountGroup(info,id){const raw=(info.label||info.name||id||'').trim();const email=(raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[''])[0].toLowerCase();return email||raw.toLowerCase().replace(/-(team|prolite|pro)\b.*$/i,'').trim()||id}
+ function accountType(info,id){const raw=(info.label||info.name||id||'').toLowerCase();if(/(^|[-_ ])team\b/.test(raw))return 0;if(/prolite|(^|[-_ ])pro\b/.test(raw))return 1;return 2}
  function renderStatus(){
- const byID=new Map((snapshot.account_index||[]).map(a=>[a.id,a]));const present=new Set();$('accounts').querySelector('.empty-row')?.remove();
- for(const a of snapshot.runtime.accounts){present.add(a.id);const info=byID.get(a.id)||{},row=rows.get(a.id)||makeRow(a,info);row.name.textContent=info.label||info.name||a.id;row.provider.textContent=providerLabel(info);row.provider.title='CPA 凭据平台：'+(info.provider||'未提供');row.note.textContent=info.disabled||info.unavailable?'CPA 标记不可用':'';
+  const byID=new Map((snapshot.account_index||[]).map(a=>[a.id,a]));const present=new Set();$('accounts').querySelector('.empty-row')?.remove();
+  const sorted=snapshot.runtime.accounts.slice().sort((a,b)=>{const ia=byID.get(a.id)||{},ib=byID.get(b.id)||{};const ga=accountGroup(ia,a.id),gb=accountGroup(ib,b.id);return ga.localeCompare(gb)||accountType(ia,a.id)-accountType(ib,b.id)||(ia.label||ia.name||a.id).localeCompare(ib.label||ib.name||b.id)});
+  for(const a of sorted){present.add(a.id);const info=byID.get(a.id)||{},row=rows.get(a.id)||makeRow(a,info);row.name.textContent=info.label||info.name||a.id;row.provider.textContent=providerLabel(info);row.provider.title='CPA 凭据平台：'+(info.provider||'未提供');row.note.textContent=info.disabled||info.unavailable?'CPA 标记不可用':'';
  row.cells[1].textContent=a.in_flight+' / '+a.policy.max_concurrency;row.cells[1].className='count';row.cells[2].textContent=a.queued+' / '+a.policy.max_queue;row.cells[3].textContent=(a.oldest_wait_ms/1000).toFixed(1)+' 秒';
- }
+  }
+  const orderedRows=sorted.map(a=>rows.get(a.id)?.tr).filter(Boolean);orderedRows.forEach(tr=>$('accounts').append(tr));
  // Retain drafts for accounts that disappear while the user edits them.
  for(const[id,row]of rows)if(!present.has(id)){row.note.textContent='本次状态中未返回该账号';row.cells[1].textContent='—';row.cells[2].textContent='—';row.cells[3].textContent='—'}
  if(!rows.size){const tr=document.createElement('tr'),td=document.createElement('td');tr.className='empty-row';td.colSpan=9;td.className='empty';td.textContent='暂无账号。请在 CPA 中添加凭证。';tr.append(td);$('accounts').append(tr)}
@@ -111,7 +115,7 @@ $('refresh').onclick=()=>load(!config);
 $('disconnect').onclick=()=>{invalidate();connected=false;key='';$('key').value='';$('remember').checked=false;const removed=storageRemove(sessionKey);config=null;revision='';snapshot=null;rows=new Map();dirty=false;$('accounts').replaceChildren();$('defaults').replaceChildren();$('runtime').textContent='';$('updated').textContent='';$('save').disabled=true;message(removed?'密钥已清除，自动刷新已停止。':'页面密钥已清除；浏览器阻止了存储清理，请关闭此标签页。',!removed)};
 $('save').onclick=async()=>{
  if(busy||!config||!connected)return;busy=true;stopTimer();const epoch=generation;$('save').disabled=true;
- try{const next=structuredClone(config);next.defaults=readFields(defaultFields,$('default-pause').checked);for(const row of rows.values()){if(row.override.checked)next.accounts[row.id]=readFields(row.fields,row.paused.checked);else delete next.accounts[row.id]}
+  try{const next=structuredClone(config);next.defaults=readFields(defaultFields,$('default-pause').checked);next.pinned_full_behavior=$('pinned-full-behavior').value;for(const row of rows.values()){if(row.override.checked)next.accounts[row.id]=readFields(row.fields,row.paused.checked);else delete next.accounts[row.id]}
  const result=await api('/policies','PUT',{revision,config:next});if(epoch!==generation)return;config=result.config;revision=result.revision;dirty=false;$('draft-note').textContent='策略已保存。自动刷新仅更新运行状态。';renderEditor();message('策略已保存。');
  }catch(error){if(epoch===generation)failed(error)}finally{if(epoch===generation){busy=false;$('save').disabled=!connected;schedule()}}
 };
