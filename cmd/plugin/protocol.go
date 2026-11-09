@@ -7,7 +7,7 @@ import (
 )
 
 const pluginID = "cpa-account-queue"
-const pluginVersion = "0.1.6-dev"
+const pluginVersion = "0.1.7-dev"
 const managementBase = "/plugins/" + pluginID
 
 type envelope struct {

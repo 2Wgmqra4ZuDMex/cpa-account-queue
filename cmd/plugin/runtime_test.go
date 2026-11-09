@@ -186,7 +186,7 @@ func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 			t.Fatal(forbidden)
 		}
 	}
-	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "affinity_fallback"} {
+	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "affinity_fallback", "accountPlatform"} {
 		if !strings.Contains(string(out.Body), required) {
 			t.Fatal(required)
 		}

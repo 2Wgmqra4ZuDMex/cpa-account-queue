@@ -53,7 +53,7 @@ with sync_playwright() as p:
     frame.locator('#remember').check()
     frame.locator('#connect').click()
     expect(frame.locator('#status')).to_contain_text('已连接')
-    expect(frame.locator('.provider-badge')).to_have_text([providers[i][1] for i in (0, 3, 4, 1, 2)])
+    expect(frame.locator('.provider-badge')).to_have_text([providers[i][1] for i in (0, 1, 3, 2, 4)])
     expect(frame.locator('#pinned-full-behavior')).to_have_value('queue')
     frame.locator('#pinned-full-behavior').select_option('fallback')
     frame.locator('#save').click()
