@@ -2,8 +2,11 @@ package admission
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +31,36 @@ var (
 
 const maxWaiting = 1024
 const maxAccounts = 4096
+const maxEvents = 256
+
+// Counters are process-local diagnostic counters. They deliberately contain
+// no request or credential identifiers and are reset when the CPA process
+// restarts.
+type Counters struct {
+	Enqueued         uint64 `json:"enqueued"`
+	Admitted         uint64 `json:"admitted"`
+	Completed        uint64 `json:"completed"`
+	Cancelled        uint64 `json:"cancelled"`
+	TimedOut         uint64 `json:"timed_out"`
+	QueueFull        uint64 `json:"queue_full"`
+	GlobalQueueFull  uint64 `json:"global_queue_full"`
+	PausedRejected   uint64 `json:"paused_rejected"`
+	DrainingRejected uint64 `json:"draining_rejected"`
+	OrphanedComplete uint64 `json:"orphaned_complete"`
+}
+
+// Event is a redacted lifecycle event retained in the in-memory ring buffer.
+// AccountTag and RequestTag are short one-way identifiers, not raw values.
+type Event struct {
+	At         time.Time `json:"at"`
+	Kind       string    `json:"kind"`
+	AccountTag string    `json:"account_tag,omitempty"`
+	RequestTag string    `json:"request_tag,omitempty"`
+	WaitMS     int64     `json:"wait_ms,omitempty"`
+	InFlight   int       `json:"in_flight"`
+	Queued     int       `json:"queued"`
+	Detail     string    `json:"detail,omitempty"`
+}
 
 type request struct {
 	id, account        string
@@ -45,21 +78,24 @@ type account struct {
 // Engine owns all local accounting. It never expires an active execution slot:
 // only request.complete may prove that an upstream request has ended.
 type Engine struct {
-	mu        sync.Mutex
-	cfg       Config
-	accounts  map[string]*account
-	requests  map[string]*request
-	completed map[string]time.Time
-	waiting   int
-	draining  bool
-	changed   chan struct{}
+	mu           sync.Mutex
+	cfg          Config
+	accounts     map[string]*account
+	accountStats map[string]*Counters
+	requests     map[string]*request
+	completed    map[string]time.Time
+	counters     Counters
+	events       []Event
+	waiting      int
+	draining     bool
+	changed      chan struct{}
 }
 
 func New(c Config) (*Engine, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{})}, nil
+	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
 }
 
 func (e *Engine) notifyLocked() { close(e.changed); e.changed = make(chan struct{}) }
@@ -71,6 +107,33 @@ func (e *Engine) accountLocked(id string) *account {
 		e.accounts[id] = a
 	}
 	return a
+}
+
+func tag(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func (e *Engine) statsLocked(accountID string) *Counters {
+	s := e.accountStats[accountID]
+	if s == nil {
+		s = &Counters{}
+		e.accountStats[accountID] = s
+	}
+	return s
+}
+
+func (e *Engine) recordLocked(kind, requestID, accountID string, waitMS int64, detail string) {
+	a := e.accounts[accountID]
+	active, queued := 0, 0
+	if a != nil {
+		active, queued = a.active, len(a.queue)
+	}
+	e.events = append(e.events, Event{At: time.Now().UTC(), Kind: kind, AccountTag: tag(accountID), RequestTag: tag(requestID), WaitMS: waitMS, InFlight: active, Queued: queued, Detail: detail})
+	if len(e.events) > maxEvents {
+		copy(e.events, e.events[len(e.events)-maxEvents:])
+		e.events = e.events[:maxEvents]
+	}
 }
 
 func (e *Engine) pruneLocked(now time.Time) {
@@ -136,6 +199,20 @@ func (e *Engine) dispatchLocked(id string) {
 		if err != nil {
 			e.removeLocked(r)
 			r.err = err
+			s := e.statsLocked(r.account)
+			switch err {
+			case ErrTimeout:
+				e.counters.TimedOut++
+				s.TimedOut++
+			case ErrPaused:
+				e.counters.PausedRejected++
+				s.PausedRejected++
+			case ErrDraining:
+				e.counters.DrainingRejected++
+				s.DrainingRejected++
+			}
+			waitMS := time.Since(r.queuedAt).Milliseconds()
+			e.recordLocked(err.(*Error).Code, r.id, r.account, waitMS, "queued request released")
 			close(r.ready)
 			continue
 		}
@@ -170,11 +247,17 @@ func (e *Engine) Acquire(ctx context.Context, id, accountID string) error {
 		return ErrCompleted
 	}
 	if e.draining {
+		e.counters.DrainingRejected++
+		e.statsLocked(accountID).DrainingRejected++
+		e.recordLocked(ErrDraining.Code, id, accountID, 0, "request rejected before queue")
 		e.mu.Unlock()
 		return ErrDraining
 	}
 	p := e.cfg.Policy(accountID)
 	if p.Paused {
+		e.counters.PausedRejected++
+		e.statsLocked(accountID).PausedRejected++
+		e.recordLocked(ErrPaused.Code, id, accountID, 0, "request rejected before queue")
 		e.mu.Unlock()
 		return ErrPaused
 	}
@@ -209,22 +292,34 @@ func (e *Engine) Acquire(ctx context.Context, id, accountID string) error {
 			r.active = true
 			a.active++
 			e.requests[id] = r
+			e.counters.Admitted++
+			e.statsLocked(accountID).Admitted++
+			e.recordLocked("admitted", id, accountID, 0, "immediate")
 			close(r.ready)
 			e.notifyLocked()
 			e.mu.Unlock()
 			return nil
 		}
 		if len(a.queue) >= p.MaxQueue {
+			e.counters.QueueFull++
+			e.statsLocked(accountID).QueueFull++
+			e.recordLocked(ErrQueueFull.Code, id, accountID, 0, "account queue full")
 			e.mu.Unlock()
 			return ErrQueueFull
 		}
 		if e.waiting >= maxWaiting {
+			e.counters.GlobalQueueFull++
+			e.statsLocked(accountID).GlobalQueueFull++
+			e.recordLocked(ErrGlobalQueue.Code, id, accountID, 0, "global queue full")
 			e.mu.Unlock()
 			return ErrGlobalQueue
 		}
 		a.queue = append(a.queue, r)
 		e.waiting++
 		e.requests[id] = r
+		e.counters.Enqueued++
+		e.statsLocked(accountID).Enqueued++
+		e.recordLocked("enqueued", id, accountID, 0, "waiting for account slot")
 		e.notifyLocked()
 	}
 	deadline := r.deadline
@@ -252,6 +347,15 @@ func (e *Engine) Acquire(ctx context.Context, id, accountID string) error {
 		if e.requests[id] == r {
 			e.removeLocked(r)
 			r.err = waitErr
+			if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+				e.counters.Cancelled++
+				e.statsLocked(accountID).Cancelled++
+				e.recordLocked("request_cancelled", id, accountID, time.Since(r.queuedAt).Milliseconds(), "wait context ended")
+			} else if errors.Is(waitErr, ErrTimeout) {
+				e.counters.TimedOut++
+				e.statsLocked(accountID).TimedOut++
+				e.recordLocked(ErrTimeout.Code, id, accountID, time.Since(r.queuedAt).Milliseconds(), "wait timeout")
+			}
 			select {
 			case <-r.ready:
 			default:
@@ -265,6 +369,9 @@ func (e *Engine) Acquire(ctx context.Context, id, accountID string) error {
 	if !r.active || e.requests[id] != r {
 		return ErrCompleted
 	}
+	e.counters.Admitted++
+	e.statsLocked(accountID).Admitted++
+	e.recordLocked("admitted", id, accountID, time.Since(r.queuedAt).Milliseconds(), "released from queue")
 	return nil
 }
 
@@ -277,14 +384,27 @@ func (e *Engine) Complete(id string) {
 	e.pruneLocked(time.Now())
 	e.completed[id] = time.Now().Add(2 * time.Minute)
 	if r := e.requests[id]; r != nil {
+		wasActive := r.active
 		e.removeLocked(r)
 		r.err = ErrCompleted
+		if wasActive {
+			e.counters.Completed++
+			e.statsLocked(r.account).Completed++
+			e.recordLocked("completed", id, r.account, time.Since(r.queuedAt).Milliseconds(), "host completion callback")
+		} else {
+			e.counters.Cancelled++
+			e.statsLocked(r.account).Cancelled++
+			e.recordLocked("request_cancelled", id, r.account, time.Since(r.queuedAt).Milliseconds(), "host completion while queued")
+		}
 		select {
 		case <-r.ready:
 		default:
 			close(r.ready)
 		}
 		e.dispatchLocked(r.account)
+	} else {
+		e.counters.OrphanedComplete++
+		e.recordLocked("orphaned_complete", id, "", 0, "completion callback had no active request")
 	}
 	e.notifyLocked()
 }
@@ -345,12 +465,13 @@ func (e *Engine) Drain(ctx context.Context) error {
 }
 
 type AccountSnapshot struct {
-	ID           string `json:"id"`
-	Policy       Policy `json:"policy"`
-	Override     bool   `json:"override"`
-	InFlight     int    `json:"in_flight"`
-	Queued       int    `json:"queued"`
-	OldestWaitMS int64  `json:"oldest_wait_ms"`
+	ID           string   `json:"id"`
+	Policy       Policy   `json:"policy"`
+	Override     bool     `json:"override"`
+	InFlight     int      `json:"in_flight"`
+	Queued       int      `json:"queued"`
+	OldestWaitMS int64    `json:"oldest_wait_ms"`
+	Counters     Counters `json:"counters"`
 }
 
 type Snapshot struct {
@@ -358,6 +479,8 @@ type Snapshot struct {
 	Waiting          int               `json:"waiting"`
 	GlobalQueueLimit int               `json:"global_queue_limit"`
 	Accounts         []AccountSnapshot `json:"accounts"`
+	Counters         Counters          `json:"counters"`
+	RecentEvents     []Event           `json:"recent_events"`
 }
 
 func (e *Engine) Snapshot(ids []string) Snapshot {
@@ -373,10 +496,16 @@ func (e *Engine) Snapshot(ids []string) Snapshot {
 	for id := range e.cfg.Accounts {
 		set[id] = true
 	}
-	out := Snapshot{Draining: e.draining, Waiting: e.waiting, GlobalQueueLimit: maxWaiting, Accounts: []AccountSnapshot{}}
+	for id := range e.accountStats {
+		set[id] = true
+	}
+	out := Snapshot{Draining: e.draining, Waiting: e.waiting, GlobalQueueLimit: maxWaiting, Accounts: []AccountSnapshot{}, Counters: e.counters, RecentEvents: append([]Event(nil), e.events...)}
 	for id := range set {
 		s := AccountSnapshot{ID: id, Policy: e.cfg.Policy(id)}
 		_, s.Override = e.cfg.Accounts[id]
+		if stats := e.accountStats[id]; stats != nil {
+			s.Counters = *stats
+		}
 		if a := e.accounts[id]; a != nil {
 			s.InFlight = a.active
 			s.Queued = len(a.queue)

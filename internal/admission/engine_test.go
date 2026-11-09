@@ -130,6 +130,39 @@ func TestTimeoutDoesNotLeak(t *testing.T) {
 	mustAcquire(t, e, "next", "a")
 }
 
+func TestDiagnosticsRecordQueueTimeoutAndCompletion(t *testing.T) {
+	e := engine(t, 1, 1, 20)
+	mustAcquire(t, e, "active", "account")
+	if err := e.Acquire(context.Background(), "wait", "account"); !errors.Is(err, ErrTimeout) {
+		t.Fatal(err)
+	}
+	e.Complete("active")
+	s := e.Snapshot(nil)
+	if s.Counters.TimedOut != 1 || s.Counters.Completed != 1 || s.Counters.Enqueued != 1 {
+		t.Fatalf("unexpected counters: %+v", s.Counters)
+	}
+	if len(s.RecentEvents) < 3 {
+		t.Fatalf("expected lifecycle events: %+v", s.RecentEvents)
+	}
+	for _, event := range s.RecentEvents {
+		if event.AccountTag == "account" || event.RequestTag == "active" || event.RequestTag == "wait" {
+			t.Fatalf("diagnostic event leaked raw identifier: %+v", event)
+		}
+	}
+}
+
+func TestDiagnosticsRecordOrphanCompletion(t *testing.T) {
+	e := engine(t, 1, 0, 100)
+	e.Complete("unknown")
+	s := e.Snapshot(nil)
+	if s.Counters.OrphanedComplete != 1 {
+		t.Fatalf("unexpected counters: %+v", s.Counters)
+	}
+	if len(s.RecentEvents) != 1 || s.RecentEvents[0].Kind != "orphaned_complete" {
+		t.Fatalf("unexpected events: %+v", s.RecentEvents)
+	}
+}
+
 func TestDuplicateAndFailover(t *testing.T) {
 	e := engine(t, 1, 0, 100)
 	mustAcquire(t, e, "r", "a")

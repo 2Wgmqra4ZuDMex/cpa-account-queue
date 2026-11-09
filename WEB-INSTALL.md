@@ -1,6 +1,6 @@
 # CPA Web 安装（开发预览）
 
-当前发布：`v0.1.2-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
+当前发布：`v0.1.3-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
 运行功能已在 v8.0.48 和 v8.0.49 上测试。不是官方商店收录项目。
 
 ## 添加插件源
@@ -18,13 +18,13 @@ plugins:
 仓库及 Release 公开，不需要 GitHub Token。
 
 进入 Web 插件商店，刷新，找到 **CPA Account Queue (Development Preview)**，
-确认来源及版本 `0.1.2-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
+确认来源及版本 `0.1.3-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
 此源使用 `direct` 固定版本下载，因此不依赖 GitHub 的 latest release（预发布不会自动成为 latest）。
 
 可改用固定版本源，避免 main 指向后续版本：
 
 ```text
-https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.2-dev/registry.json
+https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.3-dev/registry.json
 ```
 
 ## 首次启用
@@ -51,5 +51,7 @@ https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.2-dev
 第一版 0.1.0-dev 使用已通过 CI 和服务器隔离测试的原始二进制。
 0.1.1-dev 更新管理页面：跟随官方主题、自动刷新间隔设置、可选记住本次会话；并发与排队引擎未改动。
 0.1.2-dev 为账号名称增加凭据平台标签，自动刷新时同步更新平台和显示名称并保留策略草稿；未知平台保留原名，缺少元数据显示“未知平台”。并发与排队引擎未改动。
+- 后续诊断版本将在不改变排队/账号选择语义的前提下，提供进程内累计计数和最近脱敏生命周期事件；安装前仍需按发布版本重新完成隔离验收。
+0.1.3-dev 增加进程内累计诊断计数、最近脱敏生命周期事件和管理页面诊断展示；不改变账号选择与排队语义。
 勾选会话记忆后，密钥存于当前来源的 sessionStorage；同标签页刷新可恢复。
 浏览器“恢复会话”功能可能保留会话存储，离开共享设备时请点击“清除密钥”。
