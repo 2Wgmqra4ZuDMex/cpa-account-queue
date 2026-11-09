@@ -18,14 +18,29 @@ import (
 )
 
 type runtime struct {
-	mu         sync.Mutex
-	engine     *admission.Engine
-	config     admission.Config
-	statePath  string
-	configured bool
+	mu          sync.Mutex
+	engine      *admission.Engine
+	diagnostics *diagnosticsWriter
+	config      admission.Config
+	statePath   string
+	configured  bool
 }
 
 var app = &runtime{}
+
+func (r *runtime) closeDiagnostics() {
+	r.mu.Lock()
+	d := r.diagnostics
+	e := r.engine
+	r.diagnostics = nil
+	r.mu.Unlock()
+	if e != nil {
+		e.SetEventSink(nil)
+	}
+	if d != nil {
+		d.close()
+	}
+}
 
 func (r *runtime) configure(raw []byte) error {
 	var in lifecycleInput
@@ -87,6 +102,15 @@ func (r *runtime) configure(raw []byte) error {
 	r.config = c
 	r.statePath = path
 	r.configured = true
+	if r.diagnostics == nil {
+		if d, diagErr := newDiagnosticsWriter(filepath.Join(filepath.Dir(path), "diagnostics.jsonl")); diagErr == nil {
+			r.diagnostics = d
+			r.engine.SetEventSink(d.Enqueue)
+			r.engine.RecordEvent("plugin_started", "diagnostics writer enabled")
+		}
+	} else {
+		r.engine.RecordEvent("plugin_reconfigured", "policies reloaded")
+	}
 	return nil
 }
 
@@ -184,7 +208,16 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 		}
 		return ok(struct{}{})
 	case "plugin.shutdown":
+		e.RecordEvent("plugin_shutdown", "shutdown requested")
 		e.BeginDrain()
+		r.mu.Lock()
+		d := r.diagnostics
+		r.diagnostics = nil
+		r.mu.Unlock()
+		e.SetEventSink(nil)
+		if d != nil {
+			d.close()
+		}
 		return ok(struct{}{})
 	default:
 		return nil, fmt.Errorf("unsupported plugin method")
@@ -217,12 +250,26 @@ func (r *runtime) management(in managementInput) ([]byte, error) {
 			ids = append(ids, v.ID)
 		}
 		s := e.Snapshot(ids)
-		return managementJSON(200, map[string]any{"version": pluginVersion, "authority": "local", "runtime": s, "account_index": entries, "account_index_available": listErr == nil, "account_index_error": func() string {
+		r.mu.Lock()
+		diagnostics := diagnosticsStatus{}
+		if r.diagnostics != nil {
+			diagnostics = r.diagnostics.status()
+		}
+		r.mu.Unlock()
+		return managementJSON(200, map[string]any{"version": pluginVersion, "authority": "local", "runtime": s, "diagnostics": diagnostics, "account_index": entries, "account_index_available": listErr == nil, "account_index_error": func() string {
 			if listErr != nil {
 				return "CPA account listing unavailable; active and configured accounts remain visible"
 			}
 			return ""
 		}()})
+	case in.Method == "GET" && strings.HasSuffix(in.Path, managementBase+"/diagnostics"):
+		r.mu.Lock()
+		diagnostics := diagnosticsStatus{}
+		if r.diagnostics != nil {
+			diagnostics = r.diagnostics.status()
+		}
+		r.mu.Unlock()
+		return managementJSON(200, diagnostics)
 	case in.Method == "GET" && strings.HasSuffix(in.Path, managementBase+"/policies"):
 		r.mu.Lock()
 		c := r.config.Clone()

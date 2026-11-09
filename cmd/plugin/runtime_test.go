@@ -15,6 +15,7 @@ import (
 func setupRuntime(t *testing.T) *runtime {
 	t.Helper()
 	r := &runtime{}
+	t.Cleanup(r.closeDiagnostics)
 	raw, _ := json.Marshal(lifecycleInput{SchemaVersion: 9, ConfigYAML: []byte("state_path: " + filepath.ToSlash(filepath.Join(t.TempDir(), "policies.json")) + "\ndefaults:\n  max_concurrency: 1\n  max_queue: 2\n  wait_timeout_ms: 1000\n")})
 	if _, err := r.handle("plugin.register", raw); err != nil {
 		t.Fatal(err)
@@ -185,7 +186,7 @@ func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 			t.Fatal(forbidden)
 		}
 	}
-	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete"} {
+	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "持久化日志", "affinity_fallback"} {
 		if !strings.Contains(string(out.Body), required) {
 			t.Fatal(required)
 		}
@@ -214,4 +215,5 @@ func TestInvalidHostRejectedAndEmptyReloadRecovers(t *testing.T) {
 		}
 		r.handle("request.complete", requestJSON(id, "account"))
 	}
+	r.closeDiagnostics()
 }

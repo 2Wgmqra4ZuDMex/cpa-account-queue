@@ -88,6 +88,7 @@ type Engine struct {
 	completed    map[string]time.Time
 	counters     Counters
 	events       []Event
+	eventSink    func(Event)
 	waiting      int
 	draining     bool
 	changed      chan struct{}
@@ -101,6 +102,15 @@ func New(c Config) (*Engine, error) {
 }
 
 func (e *Engine) notifyLocked() { close(e.changed); e.changed = make(chan struct{}) }
+
+// SetEventSink installs a non-blocking observer for lifecycle events. The
+// callback runs while the engine lock is held and must never perform blocking
+// work; the plugin runtime uses a bounded channel to persist events later.
+func (e *Engine) SetEventSink(sink func(Event)) {
+	e.mu.Lock()
+	e.eventSink = sink
+	e.mu.Unlock()
+}
 
 func (e *Engine) accountLocked(id string) *account {
 	a := e.accounts[id]
@@ -131,11 +141,29 @@ func (e *Engine) recordLocked(kind, requestID, accountID string, waitMS int64, d
 	if a != nil {
 		active, queued = a.active, len(a.queue)
 	}
-	e.events = append(e.events, Event{At: time.Now().UTC(), Kind: kind, AccountTag: tag(accountID), RequestTag: tag(requestID), WaitMS: waitMS, InFlight: active, Queued: queued, Detail: detail})
+	event := Event{At: time.Now().UTC(), Kind: kind, WaitMS: waitMS, InFlight: active, Queued: queued, Detail: detail}
+	if accountID != "" {
+		event.AccountTag = tag(accountID)
+	}
+	if requestID != "" {
+		event.RequestTag = tag(requestID)
+	}
+	e.events = append(e.events, event)
 	if len(e.events) > maxEvents {
 		copy(e.events, e.events[len(e.events)-maxEvents:])
 		e.events = e.events[:maxEvents]
 	}
+	if e.eventSink != nil {
+		e.eventSink(event)
+	}
+}
+
+// RecordEvent adds a lifecycle event that is not tied to an admission request,
+// such as plugin startup or shutdown. It is also sent to the persistence sink.
+func (e *Engine) RecordEvent(kind, detail string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.recordLocked(kind, "", "", 0, detail)
 }
 
 func (e *Engine) pruneLocked(now time.Time) {
