@@ -14,9 +14,10 @@ import (
 
 func setupRuntime(t *testing.T) *runtime {
 	t.Helper()
+	stateDir := t.TempDir()
 	r := &runtime{}
 	t.Cleanup(r.closeDiagnostics)
-	raw, _ := json.Marshal(lifecycleInput{SchemaVersion: 9, ConfigYAML: []byte("state_path: " + filepath.ToSlash(filepath.Join(t.TempDir(), "policies.json")) + "\ndefaults:\n  max_concurrency: 1\n  max_queue: 2\n  wait_timeout_ms: 1000\n")})
+	raw, _ := json.Marshal(lifecycleInput{SchemaVersion: 9, ConfigYAML: []byte("state_path: " + filepath.ToSlash(filepath.Join(stateDir, "policies.json")) + "\ndefaults:\n  max_concurrency: 1\n  max_queue: 2\n  wait_timeout_ms: 1000\n")})
 	if _, err := r.handle("plugin.register", raw); err != nil {
 		t.Fatal(err)
 	}
