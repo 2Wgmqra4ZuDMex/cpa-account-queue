@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -37,18 +38,18 @@ const maxEvents = 256
 // no request or credential identifiers and are reset when the CPA process
 // restarts.
 type Counters struct {
-	Enqueued          uint64 `json:"enqueued"`
-	Admitted          uint64 `json:"admitted"`
-	Completed         uint64 `json:"completed"`
-	Cancelled         uint64 `json:"cancelled"`
-	TimedOut          uint64 `json:"timed_out"`
-	QueueFull         uint64 `json:"queue_full"`
-	GlobalQueueFull   uint64 `json:"global_queue_full"`
-	PausedRejected    uint64 `json:"paused_rejected"`
-	DrainingRejected  uint64 `json:"draining_rejected"`
-	OrphanedComplete  uint64 `json:"orphaned_complete"`
-	PinnedAccountFull uint64 `json:"pinned_account_full"`
-	AffinityFallback  uint64 `json:"affinity_fallback"`
+	Enqueued         uint64 `json:"enqueued"`
+	Admitted         uint64 `json:"admitted"`
+	Completed        uint64 `json:"completed"`
+	Cancelled        uint64 `json:"cancelled"`
+	TimedOut         uint64 `json:"timed_out"`
+	QueueFull        uint64 `json:"queue_full"`
+	GlobalQueueFull  uint64 `json:"global_queue_full"`
+	PausedRejected   uint64 `json:"paused_rejected"`
+	DrainingRejected uint64 `json:"draining_rejected"`
+	OrphanedComplete uint64 `json:"orphaned_complete"`
+	NoFreeAccount    uint64 `json:"no_free_account"`
+	PriorityOverflow uint64 `json:"priority_overflow"`
 }
 
 // Event is a redacted lifecycle event retained in the in-memory ring buffer.
@@ -77,6 +78,12 @@ type account struct {
 	queue  []*request
 }
 
+// reservation is a scheduler pick whose admission has not arrived yet.
+type reservation struct {
+	account string
+	expires time.Time
+}
+
 // Engine owns all local accounting. It never expires an active execution slot:
 // only request.complete may prove that an upstream request has ended.
 type Engine struct {
@@ -89,17 +96,21 @@ type Engine struct {
 	counters     Counters
 	events       []Event
 	eventSink    func(Event)
-	candidates   map[string][]string
-	waiting      int
-	draining     bool
-	changed      chan struct{}
+	// reserved maps a host selection ID to its pick until the matching
+	// admission arrives or the entry expires. It only steers later picks away
+	// from a slot that is about to be taken; admission never consults it.
+	reserved       map[string]reservation
+	reservationTTL time.Duration
+	waiting        int
+	draining       bool
+	changed        chan struct{}
 }
 
 func New(c Config) (*Engine, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, candidates: map[string][]string{}, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
+	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, reserved: map[string]reservation{}, reservationTTL: 5 * time.Second, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
 }
 
 func (e *Engine) notifyLocked() { close(e.changed); e.changed = make(chan struct{}) }
@@ -167,45 +178,39 @@ func (e *Engine) RecordEvent(kind, detail string) {
 	e.recordLocked(kind, "", "", 0, detail)
 }
 
-func (e *Engine) rememberCandidatesLocked(ids []string, selected string) {
-	if selected == "" || len(ids) == 0 {
+// reservedLocked drops expired picks and counts the live ones per account.
+// Expiry keeps a pick whose request never arrives from making its account
+// look busy for long.
+func (e *Engine) reservedLocked(now time.Time) map[string]int {
+	counts := map[string]int{}
+	for id, r := range e.reserved {
+		if !now.Before(r.expires) {
+			delete(e.reserved, id)
+			continue
+		}
+		counts[r.account]++
+	}
+	return counts
+}
+
+// releaseReservationLocked ends the reservation of the pick whose admission
+// just arrived. A host that does not repeat the selection ID at admission
+// still frees one pick for the account, so reservations cannot pile up. A
+// known ID that is already gone is a repeated callback and frees nothing.
+func (e *Engine) releaseReservationLocked(selectionID, accountID string) {
+	if selectionID != "" {
+		delete(e.reserved, selectionID)
 		return
 	}
-	copyIDs := append([]string(nil), ids...)
-	e.candidates[selected] = copyIDs
-	if len(e.candidates) > maxAccounts {
-		for id := range e.candidates {
-			delete(e.candidates, id)
-			break
+	oldest, found := "", false
+	for id, r := range e.reserved {
+		if r.account == accountID && (!found || r.expires.Before(e.reserved[oldest].expires)) {
+			oldest, found = id, true
 		}
 	}
-}
-
-// CandidatesFor returns the most recently observed scheduler candidates for an
-// auth ID. It is used only to make a pinned request's admission fallback use
-// the same candidate set CPA gave the scheduler.
-func (e *Engine) CandidatesFor(id string) []string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return append([]string(nil), e.candidates[id]...)
-}
-
-// AcquireSelected admits a request after the host's scheduler phase. When a
-// scheduler candidate set is known, fallback mode is also applied here so a
-// later affinity-pinned callback cannot bypass fallback admission.
-func (e *Engine) AcquireSelected(ctx context.Context, requestID, selected string, candidates []string) (string, error) {
-	accountID := selected
-	if selected != "" && len(candidates) > 0 {
-		chosen, err := e.Choose(candidates, selected)
-		if err != nil {
-			return "", err
-		}
-		accountID = chosen
+	if found {
+		delete(e.reserved, oldest)
 	}
-	if err := e.Acquire(ctx, requestID, accountID); err != nil {
-		return "", err
-	}
-	return accountID, nil
 }
 
 func (e *Engine) pruneLocked(now time.Time) {
@@ -302,6 +307,13 @@ func (e *Engine) dispatchLocked(id string) {
 // Acquire is idempotent for an already admitted request. A retry on a different
 // account releases the previous slot before entering the new account's FIFO.
 func (e *Engine) Acquire(ctx context.Context, id, accountID string) error {
+	return e.AcquirePicked(ctx, id, accountID, "")
+}
+
+// AcquirePicked is Acquire for a request whose account came from Choose under
+// selectionID. The pick's reservation ends in the same locked step as
+// admission, so the slot is never counted twice nor briefly seen as free.
+func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID string) error {
 	if id == "" || accountID == "" || len(id) > 512 || len(accountID) > 512 {
 		return ErrIdentity
 	}
@@ -312,6 +324,7 @@ func (e *Engine) Acquire(ctx context.Context, id, accountID string) error {
 		return err
 	}
 	e.mu.Lock()
+	e.releaseReservationLocked(selectionID, accountID)
 	now := time.Now()
 	e.pruneLocked(now)
 	if _, ok := e.completed[id]; ok {
@@ -591,86 +604,88 @@ func (e *Engine) Snapshot(ids []string) Snapshot {
 	return out
 }
 
-// Choose prefers immediately executable accounts; otherwise it selects the
-// shortest normalized waiting load. A pinned candidate must not silently fail
-// over because it is full. It can still queue in Acquire.
-func (e *Engine) Choose(ids []string, pinned string) (string, error) {
+// Candidate is an account the host offers for one selection. A larger
+// Priority is preferred, matching the host's own priority tiers.
+type Candidate struct {
+	ID       string
+	Priority int
+}
+
+// Choose picks the account one request should run on. An account with a free
+// slot wins, highest priority tier first. In "queue" mode only the highest
+// offered tier is considered, as the host itself would do; in "fallback" mode
+// a full tier overflows to lower tiers. When nothing is free the request goes
+// to the shortest relative queue. A pick made under a selectionID is
+// remembered until AcquirePicked sees that ID, so concurrent picks do not all
+// land on the same free slot.
+func (e *Engine) Choose(candidates []Candidate, selectionID string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.draining {
 		return "", ErrDraining
 	}
-	if pinned != "" {
-		e.rememberCandidatesLocked(ids, pinned)
-	}
-	choose := func(candidates []string) (string, int) {
-		best := ""
-		bestScore := int(^uint(0) >> 1)
-		for _, id := range candidates {
-			p := e.cfg.Policy(id)
-			if p.Paused {
-				continue
-			}
-			a := e.accounts[id]
-			active, queued := 0, 0
-			if a != nil {
-				active = a.active
-				queued = len(a.queue)
-			}
-			score := active * 1000 / p.MaxConcurrency
-			if active >= p.MaxConcurrency || queued > 0 {
-				if queued >= p.MaxQueue {
-					continue
-				}
-				score = 1000000 + (queued+1)*1000/p.MaxConcurrency
-			}
-			if score < bestScore {
-				best, bestScore = id, score
-			}
+	overflow := e.cfg.PinnedFullBehavior == "fallback"
+	top := 0
+	for i, c := range candidates {
+		if i == 0 || c.Priority > top {
+			top = c.Priority
 		}
-		return best, bestScore
 	}
-	if pinned != "" && e.cfg.PinnedFullBehavior == "fallback" {
-		p := e.cfg.Policy(pinned)
-		a := e.accounts[pinned]
+	now := time.Now()
+	reserved := e.reservedLocked(now)
+	best, bestFree, bestScore, considered := Candidate{}, false, 0, 0
+	for _, c := range candidates {
+		p := e.cfg.Policy(c.ID)
+		if p.Paused || (!overflow && c.Priority != top) {
+			continue
+		}
+		considered++
 		active, queued := 0, 0
-		if a != nil {
+		if a := e.accounts[c.ID]; a != nil {
 			active, queued = a.active, len(a.queue)
 		}
-		if !p.Paused && active < p.MaxConcurrency && queued == 0 {
-			return pinned, nil
+		// Only real occupancy may rule an account out; a reserved pick is a
+		// guess and must not turn into a rejection.
+		if (active >= p.MaxConcurrency || queued > 0) && queued >= p.MaxQueue {
+			continue
 		}
-		e.counters.PinnedAccountFull++
-		e.recordLocked("pinned_account_full", "", pinned, 0, "pinned account is full; trying fallback candidates")
-		others := make([]string, 0, len(ids))
-		for _, id := range ids {
-			if id != pinned {
-				others = append(others, id)
-			}
+		load := active + reserved[c.ID]
+		free := load < p.MaxConcurrency && queued == 0
+		score := load * 1000 / p.MaxConcurrency
+		if !free {
+			score = (queued + max(load-p.MaxConcurrency, 0) + 1) * 1000 / p.MaxConcurrency
 		}
-		if best, _ := choose(others); best != "" {
-			e.counters.AffinityFallback++
-			e.recordLocked("affinity_fallback", "", best, 0, "selected fallback for full pinned account")
-			e.rememberCandidatesLocked(ids, best)
-			return best, nil
+		var better bool
+		switch {
+		case best.ID == "":
+			better = true
+		case free != bestFree:
+			better = free
+		case free:
+			better = c.Priority > best.Priority || (c.Priority == best.Priority && score < bestScore)
+		default:
+			better = score < bestScore || (score == bestScore && c.Priority > best.Priority)
 		}
-		// No fallback is currently usable; retain the pinned account so Acquire
-		// can preserve its FIFO/timeout behavior when queue capacity remains.
-		if !p.Paused && queued < p.MaxQueue {
-			return pinned, nil
+		if better {
+			best, bestFree, bestScore = c, free, score
 		}
+	}
+	if best.ID == "" {
 		return "", ErrQueueFull
 	}
-	candidates := ids
-	if pinned != "" {
-		candidates = []string{pinned}
+	if selectionID != "" && len(e.reserved) < maxAccounts {
+		e.reserved[selectionID] = reservation{account: best.ID, expires: now.Add(e.reservationTTL)}
 	}
-	best, _ := choose(candidates)
-	if best == "" {
-		return "", ErrQueueFull
+	detail := fmt.Sprintf("offered=%d considered=%d", len(candidates), considered)
+	switch {
+	case !bestFree:
+		e.counters.NoFreeAccount++
+		e.recordLocked("no_free_account", "", best.ID, 0, "no free slot at selection; "+detail)
+	case best.Priority != top:
+		e.counters.PriorityOverflow++
+		e.recordLocked("priority_overflow", "", best.ID, 0, "higher priority accounts are full or paused; "+detail)
 	}
-	e.rememberCandidatesLocked(ids, best)
-	return best, nil
+	return best.ID, nil
 }
 
 func AsError(err error) *Error {

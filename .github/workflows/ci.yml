@@ -45,15 +45,17 @@ jobs:
       - name: Download pinned CPA host and verify release checksum
         run: |
           mkdir -p host
-          curl -fL --retry 3 https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.48/CLIProxyAPI_8.0.48_linux_amd64.tar.gz -o host/CLIProxyAPI_8.0.48_linux_amd64.tar.gz
-          curl -fL --retry 3 https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.48/checksums.txt -o host/checksums.txt
-          (cd host && grep 'CLIProxyAPI_8.0.48_linux_amd64.tar.gz$' checksums.txt | sha256sum -c -)
-          tar -xzf host/CLIProxyAPI_8.0.48_linux_amd64.tar.gz -C host
+          curl -fL --retry 3 https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.62/CLIProxyAPI_8.0.62_linux_amd64.tar.gz -o host/CLIProxyAPI_8.0.62_linux_amd64.tar.gz
+          curl -fL --retry 3 https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.62/checksums.txt -o host/checksums.txt
+          (cd host && grep 'CLIProxyAPI_8.0.62_linux_amd64.tar.gz$' checksums.txt | sha256sum -c -)
+          tar -xzf host/CLIProxyAPI_8.0.62_linux_amd64.tar.gz -C host
       - name: Isolated pinned CPA integration
         run: |
           python3 -m venv /tmp/queue-integration-venv
           /tmp/queue-integration-venv/bin/pip install PyYAML==6.0.3
-          /tmp/queue-integration-venv/bin/python tests/host_integration.py "$(find host -maxdepth 2 -type f -iname 'cli*proxy*' ! -name '*.tar.gz' | head -n 1)" dist/cpa-account-queue.so
+          host_binary="$(find host -maxdepth 2 -type f -iname 'cli*proxy*' ! -name '*.tar.gz' | head -n 1)"
+          /tmp/queue-integration-venv/bin/python tests/host_integration.py "$host_binary" dist/cpa-account-queue.so
+          /tmp/queue-integration-venv/bin/python tests/host_priority.py "$host_binary" dist/cpa-account-queue.so
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cpa-account-queue-linux-amd64-dev

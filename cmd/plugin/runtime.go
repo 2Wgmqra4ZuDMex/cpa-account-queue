@@ -123,13 +123,11 @@ func (r *runtime) current() (*admission.Engine, error) {
 	return r.engine, nil
 }
 
-func pinned(metadata map[string]any) string {
-	for _, key := range []string{"pinned_auth_id", "session_auth_id", "affinity_auth_id"} {
-		if id, ok := metadata[key].(string); ok && strings.TrimSpace(id) != "" {
-			return strings.TrimSpace(id)
-		}
-	}
-	return ""
+// selectionID returns the host's per-pick identifier, which it sends with the
+// scheduler pick and again with that pick's after-auth interception.
+func selectionID(metadata map[string]any) string {
+	id, _ := metadata["selection_id"].(string)
+	return strings.TrimSpace(id)
 }
 
 func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
@@ -160,13 +158,15 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, err
 		}
-		ids := []string{}
+		// The host already limits Candidates to a pinned credential when one
+		// applies, so the list is the complete set this request may run on.
+		candidates := make([]admission.Candidate, 0, len(in.Candidates))
 		for _, c := range in.Candidates {
 			if c.ID != "" {
-				ids = append(ids, c.ID)
+				candidates = append(candidates, admission.Candidate{ID: c.ID, Priority: c.Priority})
 			}
 		}
-		id, err := e.Choose(ids, pinned(in.Options.Metadata))
+		id, err := e.Choose(candidates, selectionID(in.Options.Metadata))
 		if err != nil {
 			return nil, err
 		}
@@ -176,21 +176,10 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, err
 		}
+		// The host has already committed to this credential and this callback
+		// cannot change it, so admission must account for exactly that one.
 		id, _ := in.Metadata["selected_auth_id"].(string)
-		id = strings.TrimSpace(id)
-		candidates := in.Candidates
-		if len(candidates) == 0 {
-			candidates = e.CandidatesFor(id)
-		}
-		if rawCandidates, ok := in.Metadata["candidate_auth_ids"].([]any); ok {
-			candidates = candidates[:0]
-			for _, raw := range rawCandidates {
-				if candidate, ok := raw.(string); ok && strings.TrimSpace(candidate) != "" {
-					candidates = append(candidates, strings.TrimSpace(candidate))
-				}
-			}
-		}
-		if _, err := e.AcquireSelected(context.Background(), strings.TrimSpace(in.RequestID), id, candidates); err != nil {
+		if err := e.AcquirePicked(context.Background(), strings.TrimSpace(in.RequestID), strings.TrimSpace(id), selectionID(in.Metadata)); err != nil {
 			ae := admission.AsError(err)
 			body, _ := json.Marshal(map[string]any{"error": map[string]any{"code": ae.Code, "type": ae.Code, "message": ae.Message, "retryable": ae.Status == 503}})
 			return ok(interceptOutput{Terminate: true, StatusCode: ae.Status, ResponseBody: body, ResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"1"}}})

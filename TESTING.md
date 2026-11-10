@@ -47,8 +47,32 @@ Windows amd64，Go 1.26.10（官方便携包，经官方 SHA256 校验），CGO 
 取消、超时、暂停、降低限额、排空失败不清零、空闲重启恢复、配置存储及版本冲突。
 - 诊断测试覆盖队列超时、完成回调、孤儿完成回调及账号/请求标识脱敏。
 - 诊断日志测试覆盖 JSONL 持久化、关闭时 flush 和日志状态计数。
-- 诊断测试覆盖固定账号满载时回退到空闲候选账号，以及无可用候选时继续固定账号排队。
-- 回归测试覆盖 scheduler 后 affinity 固定、随后在 `request.intercept_after` 阶段仍能回退到空闲候选账号。
+- 调度测试覆盖：同优先级选空闲账号；`queue` 模式只用最高优先级；`fallback` 模式溢出到较低优先级并在高优先级空出后恢复；全部满载时进入相对最短队列；暂停账号被跳过；无可排队账号时拒绝。
+- 调度测试覆盖并发选择：选择结果在对应接纳到达前被记住，多个同时到达的请求不会都选中同一个空闲名额；请求未到达的选择会过期，且从不阻止接纳。
+- 协议测试覆盖 `request.intercept_after` 只对 CPA 选定的账号记账，不会把占用记到其他账号。
+
+## 0.1.9-dev 优先级调度验收（2026-11-10）
+
+0.1.4 至 0.1.8 的 `fallback` 建立在错误前提上，这一版按 CPA v8.0.62（4b3f2c7）源码重做：
+
+- 插件注册 scheduler 后，CPA 不再调用内置选择器；普通请求不携带 `pinned_auth_id`，因此旧的“固定账号满载”分支在生产中从未触发。
+- CPA 默认只把当前可用的最高优先级账号交给插件；生产的 60 秒 503 发生在最高优先级只剩一个并发为 1 的账号可用时。插件现在声明 `scheduler_across_priorities`，取得全部优先级的候选及其 `priority`。
+- `request.intercept_after` 的返回值不能改变 CPA 执行的账号，0.1.8 在该阶段改选账号会让记账与实际执行不一致，已移除。
+
+真实宿主验收脚本 `tests/host_priority.py`：CPA v8.0.62 官方发布包（校验 SHA256），
+`weighted-round-robin` + `session-affinity: true`，两个假 Claude API-key 凭据提供同一模型，
+`team` 优先级 0、`prolite` 优先级 -10，模拟上游按请求携带的密钥记录实际执行的凭据。本机 WSL2 多次连续运行通过：
+
+- `queue` 模式：Team 占用时第二个请求排队并以 `account_queue_timeout` 返回 503，ProLite 没有收到请求（复现生产故障）。
+- `fallback` 模式：同样情形下第二个请求立即在 ProLite 执行，Team 无排队；插件占用与上游实际并发一致。
+- ProLite 并发设为 2 时上游峰值为 2；Team 与 ProLite 全满后新请求排队，释放后全部成功。
+- 3 个同时到达并在上游保持的请求分散为 Team 1 个、ProLite 2 个，没有排队或超时。
+- Team 空闲后，后续请求全部回到 Team。
+
+同一脚本对 0.1.8-dev 二进制运行，在 `fallback` 步骤失败：第二个请求记录 `pinned_account_full` 后仍在 Team 排队直到超时，没有溢出到 ProLite。
+原有 `tests/host_integration.py` 在 v8.0.62 上也通过。
+
+未覆盖：真实 OAuth 凭据、Codex 上游、冷却中的账号被 CPA 过滤后的候选集合（由 CPA 负责，本测试未制造冷却）。
 
 ## Linux 构建与真实宿主联调
 

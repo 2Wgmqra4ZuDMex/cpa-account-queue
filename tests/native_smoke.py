@@ -82,6 +82,7 @@ with tempfile.TemporaryDirectory() as tmp:
     registration = call("plugin.register", lifecycle)
     assert registration["metadata"]["Name"] == "cpa-account-queue"
     assert registration["capabilities"]["request_interceptor_omit_body_after"]
+    assert registration["capabilities"]["scheduler_across_priorities"]
     assert not call("request.intercept_after", request("first"))["Terminate"]
     result = []
     thread = threading.Thread(target=lambda: result.append(call("request.intercept_after", request("second"))))

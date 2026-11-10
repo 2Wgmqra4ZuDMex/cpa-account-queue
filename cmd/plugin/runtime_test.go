@@ -93,6 +93,117 @@ func TestProtocolCancellationViaCompletion(t *testing.T) {
 	}
 }
 
+// pick sends the host's scheduler request shape: every available credential
+// across priority tiers, each with its priority, under one selection ID.
+func pick(t *testing.T, r *runtime, selection string) string {
+	t.Helper()
+	raw := []byte(`{"Provider":"codex","Model":"m","Options":{"Metadata":{"selection_id":"` + selection + `"}},"Candidates":[{"ID":"team","Provider":"codex","Priority":0},{"ID":"prolite","Provider":"codex","Priority":-10}]}`)
+	b, err := r.handle("scheduler.pick", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decodeResult[struct {
+		Handled bool
+		AuthID  string
+	}](t, b)
+	if !out.Handled {
+		t.Fatal("scheduler did not handle the pick")
+	}
+	return out.AuthID
+}
+
+// admitJSON is the after-auth interception the host sends for a pick.
+func admitJSON(id, account, selection string) []byte {
+	b, _ := json.Marshal(requestInput{RequestID: id, Metadata: map[string]any{"selected_auth_id": account, "selection_id": selection}})
+	return b
+}
+
+func setBehavior(t *testing.T, r *runtime, behavior string) {
+	t.Helper()
+	c := r.config.Clone()
+	c.PinnedFullBehavior = behavior
+	body, _ := json.Marshal(map[string]any{"revision": revision(r.config), "config": c})
+	b, err := r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/policies", Body: body})
+	if err != nil || decodeResult[managementOutput](t, b).StatusCode != 200 {
+		t.Fatalf("save behavior: %v %s", err, b)
+	}
+}
+
+func occupancy(r *runtime) map[string]admission.AccountSnapshot {
+	rows := map[string]admission.AccountSnapshot{}
+	for _, row := range r.engine.Snapshot(nil).Accounts {
+		rows[row.ID] = row
+	}
+	return rows
+}
+
+func admit(t *testing.T, r *runtime, id, account string) {
+	t.Helper()
+	b, err := r.handle("request.intercept_after", admitJSON(id, account, id))
+	if err != nil || decodeResult[interceptOutput](t, b).Terminate {
+		t.Fatalf("%s not admitted on %s: %v %s", id, account, err, b)
+	}
+}
+
+// Default mode keeps the host's own rule: only the highest tier is used.
+func TestProtocolSchedulerQueueModeKeepsHighestTier(t *testing.T) {
+	r := setupRuntime(t)
+	if got := pick(t, r, "first"); got != "team" {
+		t.Fatalf("idle pick=%q", got)
+	}
+	admit(t, r, "first", "team")
+	if got := pick(t, r, "second"); got != "team" {
+		t.Fatalf("queue mode pick=%q", got)
+	}
+	r.handle("request.complete", requestJSON("first", "team"))
+}
+
+func TestProtocolSchedulerOverflowsAcrossPriorityTiers(t *testing.T) {
+	r := setupRuntime(t)
+	setBehavior(t, r, "fallback")
+	if got := pick(t, r, "first"); got != "team" {
+		t.Fatalf("idle pick=%q", got)
+	}
+	admit(t, r, "first", "team")
+	got := pick(t, r, "second")
+	if got != "prolite" {
+		t.Fatalf("fallback pick=%q", got)
+	}
+	admit(t, r, "second", got)
+	rows := occupancy(r)
+	if rows["team"].InFlight != 1 || rows["team"].Queued != 0 || rows["prolite"].InFlight != 1 {
+		t.Fatalf("unexpected occupancy: %+v", rows)
+	}
+	r.handle("request.complete", requestJSON("first", "team"))
+	r.handle("request.complete", requestJSON("second", "prolite"))
+	// With Team free again the next request returns to the top tier.
+	if got := pick(t, r, "third"); got != "team" {
+		t.Fatalf("pick after release=%q", got)
+	}
+}
+
+// The host executes on selected_auth_id regardless of what this callback
+// returns, so admission must never account for a different account.
+func TestProtocolAdmissionNeverSwitchesAccount(t *testing.T) {
+	r := setupRuntime(t)
+	setBehavior(t, r, "fallback")
+	r.handle("request.intercept_after", admitJSON("first", "team", "first"))
+	result := make(chan []byte, 1)
+	go func() {
+		b, _ := r.handle("request.intercept_after", admitJSON("second", "team", "second"))
+		result <- b
+	}()
+	waitRuntimeQueued(t, r, 1)
+	if rows := occupancy(r); rows["team"].Queued != 1 || rows["prolite"].InFlight != 0 || rows["prolite"].Queued != 0 {
+		t.Fatalf("admission moved to an account the host did not select: %+v", rows)
+	}
+	r.handle("request.complete", requestJSON("first", "team"))
+	if decodeResult[interceptOutput](t, <-result).Terminate {
+		t.Fatal("queued request rejected")
+	}
+	r.handle("request.complete", requestJSON("second", "team"))
+}
+
 func TestMetadataOnlyRegistrationAndNoStreamInterceptor(t *testing.T) {
 	b, _ := ok(registration())
 	var env struct {
@@ -105,7 +216,7 @@ func TestMetadataOnlyRegistrationAndNoStreamInterceptor(t *testing.T) {
 	if env.Result.SchemaVersion != 7 {
 		t.Fatal("schema must support omit-body")
 	}
-	for _, key := range []string{"request_interceptor_omit_body_before", "request_interceptor_omit_body_after", "request_lifecycle_plugin"} {
+	for _, key := range []string{"scheduler", "scheduler_across_priorities", "request_interceptor_omit_body_before", "request_interceptor_omit_body_after", "request_lifecycle_plugin"} {
 		if !env.Result.Capabilities[key] {
 			t.Fatal(key)
 		}
@@ -187,7 +298,7 @@ func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 			t.Fatal(forbidden)
 		}
 	}
-	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "affinity_fallback", "accountPlatform"} {
+	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "priority_overflow", "accountPlatform"} {
 		if !strings.Contains(string(out.Body), required) {
 			t.Fatal(required)
 		}

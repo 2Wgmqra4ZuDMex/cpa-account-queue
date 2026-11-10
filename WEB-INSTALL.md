@@ -1,7 +1,8 @@
 # CPA Web 安装（开发预览）
 
-当前发布：`v0.1.8-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
-运行功能已在 v8.0.48 和 v8.0.49 上测试。不是官方商店收录项目。
+当前发布：`v0.1.9-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
+排队功能已在 v8.0.48、v8.0.49 和 v8.0.62 上测试；0.1.9-dev 的跨优先级调度只在 v8.0.62 上验证过，
+宿主不支持 `scheduler_across_priorities` 时 `fallback` 不会溢出，行为与 `queue` 相同。不是官方商店收录项目。
 
 ## 添加插件源
 
@@ -18,13 +19,13 @@ plugins:
 仓库及 Release 公开，不需要 GitHub Token。
 
 进入 Web 插件商店，刷新，找到 **CPA Account Queue (Development Preview)**，
-确认来源及版本 `0.1.8-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
+确认来源及版本 `0.1.9-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
 此源使用 `direct` 固定版本下载，因此不依赖 GitHub 的 latest release（预发布不会自动成为 latest）。
 
 可改用固定版本源，避免 main 指向后续版本：
 
 ```text
-https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.8-dev/registry.json
+https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.9-dev/registry.json
 ```
 
 ## 首次启用
@@ -57,6 +58,7 @@ https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.8-dev
 0.1.5-dev 增加异步 JSONL 诊断日志、日志轮转、写入状态展示和 `/diagnostics` 管理接口。
 0.1.6-dev 将诊断页面简化为日志摘要，实时计数和最近事件改为可折叠展示。
 0.1.7-dev 修正账号表排序：平台优先，其次账号主体、账号类型和稳定账号 ID。
-0.1.8-dev 在 request.intercept_after 阶段复用 scheduler 候选集合，修复 affinity 固定账号满载时 fallback 未生效的问题。
+0.1.8-dev 在 request.intercept_after 阶段改选账号。该做法无效且会让记账与实际执行账号不一致，已在 0.1.9-dev 撤销，不要使用。
+0.1.9-dev 重做账号选择：取得全部优先级的候选账号，`fallback` 改为“最高优先级账号都满载时溢出到较低优先级账号”，`queue` 保持只用最高优先级；诊断事件改为 `no_free_account` / `priority_overflow`。0.1.4 至 0.1.8 的 `fallback` 在生产中从未生效。
 勾选会话记忆后，密钥存于当前来源的 sessionStorage；同标签页刷新可恢复。
 浏览器“恢复会话”功能可能保留会话存储，离开共享设备时请点击“清除密钥”。

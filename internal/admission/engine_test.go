@@ -257,77 +257,176 @@ func TestFailedDrainCannotBlindlyClearActiveAccounting(t *testing.T) {
 	mustAcquire(t, e, "next", "a")
 }
 
-func TestSchedulerQueuesFullAccountAndHonorsPin(t *testing.T) {
+// tiers mirrors the production shape behind the 60 s 503s: one Team account
+// alone in the top tier and a roomier ProLite account one tier below.
+var tiers = []Candidate{{ID: "team", Priority: 0}, {ID: "prolite", Priority: -10}}
+
+func tieredEngine(t *testing.T, behavior string) *Engine {
+	t.Helper()
+	c := DefaultConfig()
+	c.PinnedFullBehavior = behavior
+	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 2, WaitTimeoutMS: 1000}
+	c.Accounts["prolite"] = Policy{MaxConcurrency: 3, MaxQueue: 3, WaitTimeoutMS: 1000}
+	e, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// mustChoose makes one scheduler pick under the host selection ID sel.
+func mustChoose(t *testing.T, e *Engine, candidates []Candidate, sel, want string) {
+	t.Helper()
+	if id, err := e.Choose(candidates, sel); err != nil || id != want {
+		t.Fatalf("chose %q err=%v, want %q", id, err, want)
+	}
+}
+
+// route performs what the host does for one request: pick, then admit on the
+// picked account under the same selection ID.
+func route(t *testing.T, e *Engine, candidates []Candidate, id, want string) {
+	t.Helper()
+	mustChoose(t, e, candidates, id, want)
+	if err := e.AcquirePicked(context.Background(), id, want, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchedulerPrefersFreeAccountInSameTier(t *testing.T) {
 	e := engine(t, 1, 2, 1000)
-	mustAcquire(t, e, "active", "a")
-	if id, err := e.Choose([]string{"a", "b"}, ""); err != nil || id != "b" {
-		t.Fatalf("%s %v", id, err)
-	}
-	if id, err := e.Choose([]string{"a", "b"}, "a"); err != nil || id != "a" {
-		t.Fatalf("%s %v", id, err)
+	same := []Candidate{{ID: "a"}, {ID: "b"}}
+	route(t, e, same, "first", "a")
+	route(t, e, same, "second", "b")
+}
+
+func TestSchedulerQueueModeStaysInHighestTier(t *testing.T) {
+	e := tieredEngine(t, "queue")
+	route(t, e, tiers, "active", "team")
+	mustChoose(t, e, tiers, "next", "team")
+	s := e.Snapshot(nil)
+	if s.Counters.NoFreeAccount != 1 || s.Counters.PriorityOverflow != 0 {
+		t.Fatalf("unexpected diagnostics: %+v", s.Counters)
 	}
 }
 
-func TestSchedulerPinnedFullFallback(t *testing.T) {
-	c := DefaultConfig()
-	c.PinnedFullBehavior = "fallback"
-	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 1, WaitTimeoutMS: 1000}
-	c.Accounts["prolite"] = Policy{MaxConcurrency: 3, MaxQueue: 3, WaitTimeoutMS: 1000}
-	e, err := New(c)
-	if err != nil {
-		t.Fatal(err)
+func TestSchedulerFallbackOverflowsToLowerTier(t *testing.T) {
+	e := tieredEngine(t, "fallback")
+	route(t, e, tiers, "active", "team")
+	route(t, e, tiers, "overflow", "prolite")
+	s := e.Snapshot(nil)
+	if s.Counters.PriorityOverflow != 1 || s.Counters.Enqueued != 0 {
+		t.Fatalf("unexpected diagnostics: %+v", s.Counters)
 	}
-	mustAcquire(t, e, "active", "team")
-	if id, err := e.Choose([]string{"team", "prolite"}, "team"); err != nil || id != "prolite" {
-		t.Fatalf("fallback=%s err=%v", id, err)
+	last := s.RecentEvents[len(s.RecentEvents)-2]
+	if last.Kind != "priority_overflow" || last.AccountTag != tag("prolite") {
+		t.Fatalf("unexpected overflow event: %+v", s.RecentEvents)
 	}
-	s := e.Snapshot([]string{"team", "prolite"})
-	if s.Counters.PinnedAccountFull != 1 || s.Counters.AffinityFallback != 1 {
-		t.Fatalf("unexpected fallback diagnostics: %+v", s.Counters)
+	// The top tier is preferred again as soon as it has room.
+	e.Complete("active")
+	route(t, e, tiers, "back", "team")
+}
+
+func TestSchedulerFallbackQueuesWhenEveryTierIsFull(t *testing.T) {
+	e := tieredEngine(t, "fallback")
+	route(t, e, tiers, "team-active", "team")
+	for i := 0; i < 3; i++ {
+		route(t, e, tiers, fmt.Sprintf("prolite-%d", i), "prolite")
 	}
-	if len(s.RecentEvents) != 3 || s.RecentEvents[2].Kind != "affinity_fallback" {
-		t.Fatalf("unexpected fallback events: %+v", s.RecentEvents)
+	// ProLite has three slots, so one waiter there is a shorter relative
+	// queue than one waiter behind Team's single slot.
+	mustChoose(t, e, tiers, "next", "prolite")
+	if s := e.Snapshot(nil); s.Counters.NoFreeAccount != 1 {
+		t.Fatalf("unexpected diagnostics: %+v", s.Counters)
 	}
 }
 
-func TestSchedulerPinnedFullFallbackQueuesWhenNoAlternative(t *testing.T) {
-	c := DefaultConfig()
-	c.PinnedFullBehavior = "fallback"
-	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 1, WaitTimeoutMS: 1000}
-	e, err := New(c)
-	if err != nil {
+func TestSchedulerFallbackSkipsPausedAndQueuesOnlyCandidate(t *testing.T) {
+	e := tieredEngine(t, "fallback")
+	c := e.cfg.Clone()
+	c.Accounts["prolite"] = Policy{MaxConcurrency: 3, MaxQueue: 3, WaitTimeoutMS: 1000, Paused: true}
+	if err := e.Update(c); err != nil {
 		t.Fatal(err)
 	}
-	mustAcquire(t, e, "active", "team")
-	if id, err := e.Choose([]string{"team"}, "team"); err != nil || id != "team" {
-		t.Fatalf("pinned queue=%s err=%v", id, err)
+	route(t, e, tiers, "active", "team")
+	mustChoose(t, e, tiers, "", "team")
+	// With only the full account offered, as during a cooldown of the rest,
+	// the request still queues there rather than being rejected.
+	mustChoose(t, e, tiers[:1], "", "team")
+}
+
+func TestSchedulerRejectsWhenNoCandidateCanQueue(t *testing.T) {
+	e := engine(t, 1, 0, 1000)
+	only := []Candidate{{ID: "a"}}
+	route(t, e, only, "active", "a")
+	if _, err := e.Choose(only, "next"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := e.Choose(nil, "none"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestAcquireSelectedAppliesFallbackAfterScheduler(t *testing.T) {
-	c := DefaultConfig()
-	c.PinnedFullBehavior = "fallback"
-	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 1, WaitTimeoutMS: 1000}
-	c.Accounts["prolite"] = Policy{MaxConcurrency: 3, MaxQueue: 3, WaitTimeoutMS: 1000}
-	e, err := New(c)
-	if err != nil {
+// Picks arrive before their admissions when requests are concurrent. Without
+// remembering them, every pick would see the same free Team slot.
+func TestSchedulerConcurrentPicksDoNotShareOneFreeSlot(t *testing.T) {
+	e := tieredEngine(t, "fallback")
+	mustChoose(t, e, tiers, "first", "team")
+	mustChoose(t, e, tiers, "second", "prolite")
+	for id, account := range map[string]string{"first": "team", "second": "prolite"} {
+		if err := e.AcquirePicked(context.Background(), id, account, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := e.Snapshot(nil)
+	if s.Counters.Enqueued != 0 || s.Counters.Admitted != 2 {
+		t.Fatalf("picks collided: %+v", s.Counters)
+	}
+	// Admission ended both reservations: Team is offered again once free.
+	e.Complete("first")
+	mustChoose(t, e, tiers, "third", "team")
+}
+
+// An admission on one account leaves another account's reservation alone, so
+// that slot is still held for its own pick.
+func TestSchedulerReservationSurvivesAdmissionElsewhere(t *testing.T) {
+	e := tieredEngine(t, "fallback")
+	mustChoose(t, e, tiers, "picked", "team")
+	if err := e.AcquirePicked(context.Background(), "other", "prolite", "unrelated"); err != nil {
 		t.Fatal(err)
 	}
-	mustAcquire(t, e, "team-active", "team")
-	chosen, err := e.AcquireSelected(context.Background(), "fallback-request", "team", []string{"team", "prolite"})
-	if err != nil || chosen != "prolite" {
-		t.Fatalf("chosen=%s err=%v", chosen, err)
+	mustChoose(t, e, tiers, "later", "prolite")
+}
+
+// A host that does not repeat the selection ID at admission must not leave
+// reservations behind: the next request would be diverted for no reason.
+func TestSchedulerReservationReleasedWithoutSelectionID(t *testing.T) {
+	e := tieredEngine(t, "fallback")
+	mustChoose(t, e, tiers, "picked", "team")
+	mustAcquire(t, e, "first", "team")
+	e.Complete("first")
+	mustChoose(t, e, tiers, "next", "team")
+}
+
+func TestSchedulerForgetsPickWhoseRequestNeverArrives(t *testing.T) {
+	e := tieredEngine(t, "queue")
+	mustChoose(t, e, tiers, "lost", "team")
+	mustChoose(t, e, tiers, "next", "team")
+	if s := e.Snapshot(nil); s.Counters.NoFreeAccount != 1 {
+		t.Fatalf("second pick should have seen the first: %+v", s.Counters)
 	}
-	s := e.Snapshot([]string{"team", "prolite"})
-	rows := map[string]AccountSnapshot{}
-	for _, row := range s.Accounts {
-		rows[row.ID] = row
+	// Neither request arrives; let both reservations run out.
+	e.mu.Lock()
+	for id, r := range e.reserved {
+		r.expires = time.Now().Add(-time.Second)
+		e.reserved[id] = r
 	}
-	if rows["team"].InFlight != 1 || rows["prolite"].InFlight != 1 {
-		t.Fatalf("unexpected admission rows: %+v", rows)
+	e.mu.Unlock()
+	mustChoose(t, e, tiers, "after", "team")
+	if s := e.Snapshot(nil); s.Counters.NoFreeAccount != 1 {
+		t.Fatalf("expired picks still counted: %+v", s.Counters)
 	}
-	e.Complete("fallback-request")
-	e.Complete("team-active")
+	// A reservation never blocks admission itself.
+	mustAcquire(t, e, "real", "team")
 }
 
 func TestConcurrentAccounting(t *testing.T) {

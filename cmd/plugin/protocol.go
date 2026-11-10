@@ -7,7 +7,7 @@ import (
 )
 
 const pluginID = "cpa-account-queue"
-const pluginVersion = "0.1.8-dev"
+const pluginVersion = "0.1.9-dev"
 const managementBase = "/plugins/" + pluginID
 
 type envelope struct {
@@ -32,7 +32,6 @@ type lifecycleInput struct {
 type requestInput struct {
 	RequestID      string
 	Metadata       map[string]any
-	Candidates     []string
 	HostCallbackID string `json:"host_callback_id"`
 }
 type interceptOutput struct {
@@ -43,7 +42,10 @@ type interceptOutput struct {
 }
 type schedulerInput struct {
 	Options    struct{ Metadata map[string]any }
-	Candidates []struct{ ID string }
+	Candidates []struct {
+		ID       string
+		Priority int
+	}
 }
 type managementInput struct {
 	Method         string
@@ -72,9 +74,9 @@ func registration() any {
 		"schema_version": 7,
 		"metadata": map[string]any{"Name": pluginID, "Version": pluginVersion, "Author": "2Wgmqra4ZuDMex", "GitHubRepository": "https://github.com/2Wgmqra4ZuDMex/cpa-account-queue", "ConfigFields": []any{
 			map[string]any{"Name": "state_path", "Type": "string", "Description": "Persistent account policy JSON file; mount its directory."},
-			map[string]any{"Name": "pinned_full_behavior", "Type": "string", "Description": "Pinned account behavior when full: queue (default) or fallback."},
+			map[string]any{"Name": "pinned_full_behavior", "Type": "string", "Description": "When every account in the highest priority tier is full: queue (default) waits there, fallback overflows to lower priority accounts."},
 		}},
-		"capabilities": map[string]bool{"scheduler": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true, "request_lifecycle_plugin": true, "management_api": true},
+		"capabilities": map[string]bool{"scheduler": true, "scheduler_across_priorities": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true, "request_lifecycle_plugin": true, "management_api": true},
 	}
 }
 
