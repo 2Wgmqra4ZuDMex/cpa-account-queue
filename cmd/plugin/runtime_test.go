@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -182,6 +183,106 @@ func TestProtocolSchedulerOverflowsAcrossPriorityTiers(t *testing.T) {
 	}
 }
 
+// sessionPick is one scheduler pick over two interchangeable accounts, with
+// the session metadata the host attaches before selection.
+func sessionPick(t *testing.T, r *runtime, selection, model string, metadata map[string]any) string {
+	t.Helper()
+	metadata["selection_id"] = selection
+	raw, _ := json.Marshal(map[string]any{"Model": model, "Options": map[string]any{"Metadata": metadata}, "Candidates": []map[string]any{{"ID": "a"}, {"ID": "b"}}})
+	b, err := r.handle("scheduler.pick", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decodeResult[struct{ AuthID string }](t, b).AuthID
+}
+
+// runTurn picks, admits and completes one request, returning its account.
+func runTurn(t *testing.T, r *runtime, id, model string, metadata map[string]any) string {
+	t.Helper()
+	account := sessionPick(t, r, id, model, metadata)
+	admit(t, r, id, account)
+	r.handle("request.complete", requestJSON(id, account))
+	return account
+}
+
+func TestProtocolSessionAffinityFollowsHostSessionIdentity(t *testing.T) {
+	r := setupRuntime(t)
+	explicit := func() map[string]any { return map[string]any{"canonical_session_id": "header:conversation-one"} }
+	derived := func() map[string]any { return map[string]any{"derived_session_id": "0f3c-derived-two"} }
+	if got := runTurn(t, r, "one-1", "m", explicit()); got != "a" {
+		t.Fatalf("first session started on %q", got)
+	}
+	if got := runTurn(t, r, "two-1", "m", derived()); got != "b" {
+		t.Fatalf("second session started on %q", got)
+	}
+	for i := 2; i <= 3; i++ {
+		if got := runTurn(t, r, fmt.Sprintf("two-%d", i), "m", derived()); got != "b" {
+			t.Fatalf("derived session moved to %q", got)
+		}
+		if got := runTurn(t, r, fmt.Sprintf("one-%d", i), "m", explicit()); got != "a" {
+			t.Fatalf("explicit session moved to %q", got)
+		}
+	}
+	// A reasoning-effort suffix is the same model, so the same binding.
+	if got := runTurn(t, r, "two-effort", "m(high)", derived()); got != "b" {
+		t.Fatalf("effort suffix broke the binding: %q", got)
+	}
+	// The host scopes affinity by model; another model is another binding,
+	// placed on the account holding fewer sessions.
+	if got := runTurn(t, r, "one-other", "other", explicit()); got != "a" {
+		t.Fatalf("other model started on %q", got)
+	}
+	c := r.engine.Snapshot(nil).Counters
+	if c.AffinityNew != 3 || c.AffinityKept != 5 || c.AffinityMoved != 0 {
+		t.Fatalf("unexpected affinity counters: %+v", c)
+	}
+}
+
+func TestProtocolSessionAffinityCanBeSwitchedOff(t *testing.T) {
+	r := setupRuntime(t)
+	meta := func(id string) map[string]any { return map[string]any{"canonical_session_id": id} }
+	runTurn(t, r, "one-1", "m", meta("one"))
+	if got := runTurn(t, r, "two-1", "m", meta("two")); got != "b" {
+		t.Fatalf("second session started on %q", got)
+	}
+	c := r.config.Clone()
+	c.DisableSessionAffinity = true
+	body, _ := json.Marshal(map[string]any{"revision": revision(r.config), "config": c})
+	b, err := r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/policies", Body: body})
+	if err != nil || decodeResult[managementOutput](t, b).StatusCode != 200 {
+		t.Fatalf("save: %v %s", err, b)
+	}
+	if got := runTurn(t, r, "two-2", "m", meta("two")); got != "a" {
+		t.Fatalf("affinity still applied after being switched off: %q", got)
+	}
+	loaded, err := admission.Load(r.statePath, admission.DefaultConfig())
+	if err != nil || !loaded.DisableSessionAffinity {
+		t.Fatalf("setting not persisted: %+v %v", loaded, err)
+	}
+}
+
+// A state file saved with affinity on must stay loadable by 0.1.9, which
+// rejects unknown fields, so that downgrading does not break the plugin.
+func TestStateFileWithAffinityOnHasNoNewFields(t *testing.T) {
+	r := setupRuntime(t)
+	setBehavior(t, r, "fallback")
+	raw, err := os.ReadFile(r.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for name := range fields {
+		switch name {
+		case "version", "defaults", "accounts", "pinned_full_behavior":
+		default:
+			t.Fatalf("state file gained field %q: %s", name, raw)
+		}
+	}
+}
+
 // The host executes on selected_auth_id regardless of what this callback
 // returns, so admission must never account for a different account.
 func TestProtocolAdmissionNeverSwitchesAccount(t *testing.T) {
@@ -298,7 +399,7 @@ func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 			t.Fatal(forbidden)
 		}
 	}
-	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "priority_overflow", "accountPlatform"} {
+	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "priority_overflow", "accountPlatform", "session-affinity", "affinity_kept"} {
 		if !strings.Contains(string(out.Body), required) {
 			t.Fatal(required)
 		}

@@ -19,6 +19,9 @@ type Config struct {
 	Defaults           Policy            `json:"defaults" yaml:"defaults"`
 	Accounts           map[string]Policy `json:"accounts" yaml:"accounts"`
 	PinnedFullBehavior string            `json:"pinned_full_behavior" yaml:"pinned_full_behavior"`
+	// DisableSessionAffinity is omitted while false so that a state file
+	// written with affinity on stays readable by versions that predate it.
+	DisableSessionAffinity bool `json:"disable_session_affinity,omitempty" yaml:"-"`
 }
 
 func DefaultConfig() Config {

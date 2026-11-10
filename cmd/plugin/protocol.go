@@ -7,7 +7,7 @@ import (
 )
 
 const pluginID = "cpa-account-queue"
-const pluginVersion = "0.1.9-dev"
+const pluginVersion = "0.2.0-dev"
 const managementBase = "/plugins/" + pluginID
 
 type envelope struct {
@@ -41,6 +41,7 @@ type interceptOutput struct {
 	ResponseBody    []byte
 }
 type schedulerInput struct {
+	Model      string
 	Options    struct{ Metadata map[string]any }
 	Candidates []struct {
 		ID       string

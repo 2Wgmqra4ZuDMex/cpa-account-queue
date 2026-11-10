@@ -1,8 +1,9 @@
 # CPA Web 安装（开发预览）
 
-当前发布：`v0.1.9-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
-排队功能已在 v8.0.48、v8.0.49 和 v8.0.62 上测试；0.1.9-dev 的跨优先级调度只在 v8.0.62 上验证过，
-宿主不支持 `scheduler_across_priorities` 时 `fallback` 不会溢出，行为与 `queue` 相同。不是官方商店收录项目。
+当前发布：`v0.2.0-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
+排队功能已在 v8.0.48、v8.0.49 和 v8.0.62 上测试；跨优先级调度和会话亲和只在 v8.0.62 上验证过。
+宿主不支持 `scheduler_across_priorities` 时 `fallback` 不会溢出，行为与 `queue` 相同；
+宿主不在调度请求中提供会话标识时，会话亲和不起作用（诊断中全部计为“无会话标识”）。不是官方商店收录项目。
 
 ## 添加插件源
 
@@ -19,13 +20,13 @@ plugins:
 仓库及 Release 公开，不需要 GitHub Token。
 
 进入 Web 插件商店，刷新，找到 **CPA Account Queue (Development Preview)**，
-确认来源及版本 `0.1.9-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
+确认来源及版本 `0.2.0-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
 此源使用 `direct` 固定版本下载，因此不依赖 GitHub 的 latest release（预发布不会自动成为 latest）。
 
 可改用固定版本源，避免 main 指向后续版本：
 
 ```text
-https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.9-dev/registry.json
+https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.2.0-dev/registry.json
 ```
 
 ## 首次启用
@@ -60,5 +61,7 @@ https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.1.9-dev
 0.1.7-dev 修正账号表排序：平台优先，其次账号主体、账号类型和稳定账号 ID。
 0.1.8-dev 在 request.intercept_after 阶段改选账号。该做法无效且会让记账与实际执行账号不一致，已在 0.1.9-dev 撤销，不要使用。
 0.1.9-dev 重做账号选择：取得全部优先级的候选账号，`fallback` 改为“最高优先级账号都满载时溢出到较低优先级账号”，`queue` 保持只用最高优先级；诊断事件改为 `no_free_account` / `priority_overflow`。0.1.4 至 0.1.8 的 `fallback` 在生产中从未生效。
+0.2.0-dev 增加插件内的会话亲和（默认开启，可在插件页面关闭）：同一会话优先回到上次使用的账号，原账号满载或不可用时改绑；同优先级的新会话分散到已绑定会话较少的账号。新增诊断计数 `affinity_kept` / `affinity_moved` / `affinity_new` / `affinity_none`。
+回退到 0.1.9-dev 或更早版本之前，先在插件页面重新勾选“会话亲和”并保存：关闭亲和时策略文件会多出 `disable_session_affinity` 字段，旧版本遇到未知字段会拒绝加载。
 勾选会话记忆后，密钥存于当前来源的 sessionStorage；同标签页刷新可恢复。
 浏览器“恢复会话”功能可能保留会话存储，离开共享设备时请点击“清除密钥”。

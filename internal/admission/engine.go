@@ -33,6 +33,7 @@ var (
 const maxWaiting = 1024
 const maxAccounts = 4096
 const maxEvents = 256
+const maxSessions = 8192
 
 // Counters are process-local diagnostic counters. They deliberately contain
 // no request or credential identifiers and are reset when the CPA process
@@ -50,6 +51,10 @@ type Counters struct {
 	OrphanedComplete uint64 `json:"orphaned_complete"`
 	NoFreeAccount    uint64 `json:"no_free_account"`
 	PriorityOverflow uint64 `json:"priority_overflow"`
+	AffinityKept     uint64 `json:"affinity_kept"`
+	AffinityMoved    uint64 `json:"affinity_moved"`
+	AffinityNew      uint64 `json:"affinity_new"`
+	AffinityNone     uint64 `json:"affinity_none"`
 }
 
 // Event is a redacted lifecycle event retained in the in-memory ring buffer.
@@ -78,8 +83,16 @@ type account struct {
 	queue  []*request
 }
 
-// reservation is a scheduler pick whose admission has not arrived yet.
+// reservation is a scheduler pick whose admission has not arrived yet. note
+// describes the pick and is appended to the admission event it leads to.
 type reservation struct {
+	account string
+	expires time.Time
+	note    string
+}
+
+// binding ties a session to the account its latest request was sent to.
+type binding struct {
 	account string
 	expires time.Time
 }
@@ -101,16 +114,20 @@ type Engine struct {
 	// from a slot that is about to be taken; admission never consults it.
 	reserved       map[string]reservation
 	reservationTTL time.Duration
-	waiting        int
-	draining       bool
-	changed        chan struct{}
+	// sessions maps an opaque session key to its binding. A binding lapses
+	// once the session has been idle for sessionTTL.
+	sessions   map[string]binding
+	sessionTTL time.Duration
+	waiting    int
+	draining   bool
+	changed    chan struct{}
 }
 
 func New(c Config) (*Engine, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, reserved: map[string]reservation{}, reservationTTL: 5 * time.Second, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
+	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, reserved: map[string]reservation{}, reservationTTL: 5 * time.Second, sessions: map[string]binding{}, sessionTTL: time.Hour, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
 }
 
 func (e *Engine) notifyLocked() { close(e.changed); e.changed = make(chan struct{}) }
@@ -191,6 +208,35 @@ func (e *Engine) reservedLocked(now time.Time) map[string]int {
 		counts[r.account]++
 	}
 	return counts
+}
+
+// sessionsLocked drops lapsed bindings and counts the live ones per account.
+func (e *Engine) sessionsLocked(now time.Time) map[string]int {
+	counts := map[string]int{}
+	for key, b := range e.sessions {
+		if !now.Before(b.expires) {
+			delete(e.sessions, key)
+			continue
+		}
+		counts[b.account]++
+	}
+	return counts
+}
+
+// bindLocked records that the session's latest request went to the account.
+// At capacity the binding closest to lapsing makes room.
+func (e *Engine) bindLocked(session, accountID string, now time.Time) {
+	e.sessions[session] = binding{account: accountID, expires: now.Add(e.sessionTTL)}
+	if len(e.sessions) <= maxSessions {
+		return
+	}
+	oldest, found := "", false
+	for key, b := range e.sessions {
+		if !found || b.expires.Before(e.sessions[oldest].expires) {
+			oldest, found = key, true
+		}
+	}
+	delete(e.sessions, oldest)
 }
 
 // releaseReservationLocked ends the reservation of the pick whose admission
@@ -324,6 +370,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 		return err
 	}
 	e.mu.Lock()
+	note := e.reserved[selectionID].note
 	e.releaseReservationLocked(selectionID, accountID)
 	now := time.Now()
 	e.pruneLocked(now)
@@ -379,7 +426,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 			e.requests[id] = r
 			e.counters.Admitted++
 			e.statsLocked(accountID).Admitted++
-			e.recordLocked("admitted", id, accountID, 0, "immediate")
+			e.recordLocked("admitted", id, accountID, 0, "immediate"+note)
 			close(r.ready)
 			e.notifyLocked()
 			e.mu.Unlock()
@@ -404,7 +451,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 		e.requests[id] = r
 		e.counters.Enqueued++
 		e.statsLocked(accountID).Enqueued++
-		e.recordLocked("enqueued", id, accountID, 0, "waiting for account slot")
+		e.recordLocked("enqueued", id, accountID, 0, "waiting for account slot"+note)
 		e.notifyLocked()
 	}
 	deadline := r.deadline
@@ -501,6 +548,9 @@ func (e *Engine) Update(c Config) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cfg = c.Clone()
+	if e.cfg.DisableSessionAffinity {
+		clear(e.sessions)
+	}
 	for id := range e.accounts {
 		e.dispatchLocked(id)
 	}
@@ -611,14 +661,21 @@ type Candidate struct {
 	Priority int
 }
 
-// Choose picks the account one request should run on. An account with a free
-// slot wins, highest priority tier first. In "queue" mode only the highest
-// offered tier is considered, as the host itself would do; in "fallback" mode
-// a full tier overflows to lower tiers. When nothing is free the request goes
-// to the shortest relative queue. A pick made under a selectionID is
-// remembered until AcquirePicked sees that ID, so concurrent picks do not all
-// land on the same free slot.
-func (e *Engine) Choose(candidates []Candidate, selectionID string) (string, error) {
+// Choose picks the account one request should run on.
+//
+// With session affinity, a request whose session is bound to an offered
+// account goes there while that account has a free slot, whatever its
+// priority tier. Otherwise an account with a free slot wins: highest priority
+// tier first, then least loaded, then fewest bound sessions. In "queue" mode
+// only the highest offered tier is considered, as the host itself would do;
+// in "fallback" mode a full tier overflows to lower tiers. When nothing is
+// free the request goes to the shortest relative queue. The session is then
+// bound to the chosen account, so it follows its latest request.
+//
+// session is an opaque key, empty when the request has no session identity.
+// A pick made under a selectionID is remembered until AcquirePicked sees that
+// ID, so concurrent picks do not all land on the same free slot.
+func (e *Engine) Choose(candidates []Candidate, selectionID, session string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.draining {
@@ -633,24 +690,38 @@ func (e *Engine) Choose(candidates []Candidate, selectionID string) (string, err
 	}
 	now := time.Now()
 	reserved := e.reservedLocked(now)
+	affinity := !e.cfg.DisableSessionAffinity
+	var sessions map[string]int
+	bound := ""
+	if affinity {
+		sessions = e.sessionsLocked(now)
+		bound = e.sessions[session].account
+	}
 	best, bestFree, bestScore, considered := Candidate{}, false, 0, 0
 	for _, c := range candidates {
 		p := e.cfg.Policy(c.ID)
-		if p.Paused || (!overflow && c.Priority != top) {
+		if p.Paused {
 			continue
 		}
-		considered++
 		active, queued := 0, 0
 		if a := e.accounts[c.ID]; a != nil {
 			active, queued = a.active, len(a.queue)
 		}
+		load := active + reserved[c.ID]
+		free := load < p.MaxConcurrency && queued == 0
+		if free && bound != "" && c.ID == bound {
+			best, bestFree = c, true
+			break
+		}
+		if !overflow && c.Priority != top {
+			continue
+		}
+		considered++
 		// Only real occupancy may rule an account out; a reserved pick is a
 		// guess and must not turn into a rejection.
 		if (active >= p.MaxConcurrency || queued > 0) && queued >= p.MaxQueue {
 			continue
 		}
-		load := active + reserved[c.ID]
-		free := load < p.MaxConcurrency && queued == 0
 		score := load * 1000 / p.MaxConcurrency
 		if !free {
 			score = (queued + max(load-p.MaxConcurrency, 0) + 1) * 1000 / p.MaxConcurrency
@@ -661,10 +732,17 @@ func (e *Engine) Choose(candidates []Candidate, selectionID string) (string, err
 			better = true
 		case free != bestFree:
 			better = free
-		case free:
-			better = c.Priority > best.Priority || (c.Priority == best.Priority && score < bestScore)
+		case !free:
+			// Equal queues: wait where the session already is.
+			better = score < bestScore || (score == bestScore && (c.ID == bound || (best.ID != bound && c.Priority > best.Priority)))
+		case c.Priority != best.Priority:
+			better = c.Priority > best.Priority
+		case score != bestScore:
+			better = score < bestScore
 		default:
-			better = score < bestScore || (score == bestScore && c.Priority > best.Priority)
+			// Equally idle accounts: spread new sessions instead of always
+			// starting them on the first account offered.
+			better = sessions[c.ID] < sessions[best.ID]
 		}
 		if better {
 			best, bestFree, bestScore = c, free, score
@@ -673,15 +751,35 @@ func (e *Engine) Choose(candidates []Candidate, selectionID string) (string, err
 	if best.ID == "" {
 		return "", ErrQueueFull
 	}
+	note := ""
+	if affinity {
+		switch {
+		case session == "":
+			e.counters.AffinityNone++
+			note = "; affinity=none"
+		case bound == "":
+			e.counters.AffinityNew++
+			note = "; affinity=new session=" + tag(session)
+		case bound == best.ID:
+			e.counters.AffinityKept++
+			note = "; affinity=kept session=" + tag(session)
+		default:
+			e.counters.AffinityMoved++
+			note = "; affinity=moved session=" + tag(session)
+		}
+		if session != "" {
+			e.bindLocked(session, best.ID, now)
+		}
+	}
 	if selectionID != "" && len(e.reserved) < maxAccounts {
-		e.reserved[selectionID] = reservation{account: best.ID, expires: now.Add(e.reservationTTL)}
+		e.reserved[selectionID] = reservation{account: best.ID, expires: now.Add(e.reservationTTL), note: note}
 	}
 	detail := fmt.Sprintf("offered=%d considered=%d", len(candidates), considered)
 	switch {
 	case !bestFree:
 		e.counters.NoFreeAccount++
 		e.recordLocked("no_free_account", "", best.ID, 0, "no free slot at selection; "+detail)
-	case best.Priority != top:
+	case best.Priority != top && best.ID != bound:
 		e.counters.PriorityOverflow++
 		e.recordLocked("priority_overflow", "", best.ID, 0, "higher priority accounts are full or paused; "+detail)
 	}

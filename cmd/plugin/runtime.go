@@ -130,6 +130,28 @@ func selectionID(metadata map[string]any) string {
 	return strings.TrimSpace(id)
 }
 
+// sessionKey identifies the conversation a pick belongs to, from the identity
+// the host derives before selection, scoped by model as the host's own
+// affinity is. Only this one-way hash is kept.
+func sessionKey(model string, metadata map[string]any) string {
+	id := ""
+	for _, key := range []string{"canonical_session_id", "derived_session_id"} {
+		if value, _ := metadata[key].(string); strings.TrimSpace(value) != "" {
+			id = strings.TrimSpace(value)
+			break
+		}
+	}
+	if id == "" {
+		return ""
+	}
+	// A suffix such as "model(high)" selects reasoning effort, not a model.
+	if open := strings.LastIndex(model, "("); open > 0 && strings.HasSuffix(model, ")") {
+		model = model[:open]
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(model) + "\x00" + id))
+	return hex.EncodeToString(sum[:16])
+}
+
 func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
@@ -166,7 +188,7 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 				candidates = append(candidates, admission.Candidate{ID: c.ID, Priority: c.Priority})
 			}
 		}
-		id, err := e.Choose(candidates, selectionID(in.Options.Metadata))
+		id, err := e.Choose(candidates, selectionID(in.Options.Metadata), sessionKey(in.Model, in.Options.Metadata))
 		if err != nil {
 			return nil, err
 		}
