@@ -304,6 +304,32 @@ func TestSchedulerPinnedFullFallbackQueuesWhenNoAlternative(t *testing.T) {
 	}
 }
 
+func TestAcquireSelectedAppliesFallbackAfterScheduler(t *testing.T) {
+	c := DefaultConfig()
+	c.PinnedFullBehavior = "fallback"
+	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 1, WaitTimeoutMS: 1000}
+	c.Accounts["prolite"] = Policy{MaxConcurrency: 3, MaxQueue: 3, WaitTimeoutMS: 1000}
+	e, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAcquire(t, e, "team-active", "team")
+	chosen, err := e.AcquireSelected(context.Background(), "fallback-request", "team", []string{"team", "prolite"})
+	if err != nil || chosen != "prolite" {
+		t.Fatalf("chosen=%s err=%v", chosen, err)
+	}
+	s := e.Snapshot([]string{"team", "prolite"})
+	rows := map[string]AccountSnapshot{}
+	for _, row := range s.Accounts {
+		rows[row.ID] = row
+	}
+	if rows["team"].InFlight != 1 || rows["prolite"].InFlight != 1 {
+		t.Fatalf("unexpected admission rows: %+v", rows)
+	}
+	e.Complete("fallback-request")
+	e.Complete("team-active")
+}
+
 func TestConcurrentAccounting(t *testing.T) {
 	e := engine(t, 3, 200, 10000)
 	var running, peak atomic.Int32

@@ -7,7 +7,7 @@ import (
 )
 
 const pluginID = "cpa-account-queue"
-const pluginVersion = "0.1.7-dev"
+const pluginVersion = "0.1.8-dev"
 const managementBase = "/plugins/" + pluginID
 
 type envelope struct {
@@ -32,6 +32,7 @@ type lifecycleInput struct {
 type requestInput struct {
 	RequestID      string
 	Metadata       map[string]any
+	Candidates     []string
 	HostCallbackID string `json:"host_callback_id"`
 }
 type interceptOutput struct {

@@ -89,6 +89,7 @@ type Engine struct {
 	counters     Counters
 	events       []Event
 	eventSink    func(Event)
+	candidates   map[string][]string
 	waiting      int
 	draining     bool
 	changed      chan struct{}
@@ -98,7 +99,7 @@ func New(c Config) (*Engine, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
+	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, candidates: map[string][]string{}, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
 }
 
 func (e *Engine) notifyLocked() { close(e.changed); e.changed = make(chan struct{}) }
@@ -164,6 +165,47 @@ func (e *Engine) RecordEvent(kind, detail string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.recordLocked(kind, "", "", 0, detail)
+}
+
+func (e *Engine) rememberCandidatesLocked(ids []string, selected string) {
+	if selected == "" || len(ids) == 0 {
+		return
+	}
+	copyIDs := append([]string(nil), ids...)
+	e.candidates[selected] = copyIDs
+	if len(e.candidates) > maxAccounts {
+		for id := range e.candidates {
+			delete(e.candidates, id)
+			break
+		}
+	}
+}
+
+// CandidatesFor returns the most recently observed scheduler candidates for an
+// auth ID. It is used only to make a pinned request's admission fallback use
+// the same candidate set CPA gave the scheduler.
+func (e *Engine) CandidatesFor(id string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.candidates[id]...)
+}
+
+// AcquireSelected admits a request after the host's scheduler phase. When a
+// scheduler candidate set is known, fallback mode is also applied here so a
+// later affinity-pinned callback cannot bypass fallback admission.
+func (e *Engine) AcquireSelected(ctx context.Context, requestID, selected string, candidates []string) (string, error) {
+	accountID := selected
+	if selected != "" && len(candidates) > 0 {
+		chosen, err := e.Choose(candidates, selected)
+		if err != nil {
+			return "", err
+		}
+		accountID = chosen
+	}
+	if err := e.Acquire(ctx, requestID, accountID); err != nil {
+		return "", err
+	}
+	return accountID, nil
 }
 
 func (e *Engine) pruneLocked(now time.Time) {
@@ -558,6 +600,9 @@ func (e *Engine) Choose(ids []string, pinned string) (string, error) {
 	if e.draining {
 		return "", ErrDraining
 	}
+	if pinned != "" {
+		e.rememberCandidatesLocked(ids, pinned)
+	}
 	choose := func(candidates []string) (string, int) {
 		best := ""
 		bestScore := int(^uint(0) >> 1)
@@ -606,6 +651,7 @@ func (e *Engine) Choose(ids []string, pinned string) (string, error) {
 		if best, _ := choose(others); best != "" {
 			e.counters.AffinityFallback++
 			e.recordLocked("affinity_fallback", "", best, 0, "selected fallback for full pinned account")
+			e.rememberCandidatesLocked(ids, best)
 			return best, nil
 		}
 		// No fallback is currently usable; retain the pinned account so Acquire
@@ -623,6 +669,7 @@ func (e *Engine) Choose(ids []string, pinned string) (string, error) {
 	if best == "" {
 		return "", ErrQueueFull
 	}
+	e.rememberCandidatesLocked(ids, best)
 	return best, nil
 }
 

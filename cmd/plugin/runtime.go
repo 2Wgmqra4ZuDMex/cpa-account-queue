@@ -177,7 +177,20 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		id, _ := in.Metadata["selected_auth_id"].(string)
-		if err := e.Acquire(context.Background(), strings.TrimSpace(in.RequestID), strings.TrimSpace(id)); err != nil {
+		id = strings.TrimSpace(id)
+		candidates := in.Candidates
+		if len(candidates) == 0 {
+			candidates = e.CandidatesFor(id)
+		}
+		if rawCandidates, ok := in.Metadata["candidate_auth_ids"].([]any); ok {
+			candidates = candidates[:0]
+			for _, raw := range rawCandidates {
+				if candidate, ok := raw.(string); ok && strings.TrimSpace(candidate) != "" {
+					candidates = append(candidates, strings.TrimSpace(candidate))
+				}
+			}
+		}
+		if _, err := e.AcquireSelected(context.Background(), strings.TrimSpace(in.RequestID), id, candidates); err != nil {
 			ae := admission.AsError(err)
 			body, _ := json.Marshal(map[string]any{"error": map[string]any{"code": ae.Code, "type": ae.Code, "message": ae.Message, "retryable": ae.Status == 503}})
 			return ok(interceptOutput{Terminate: true, StatusCode: ae.Status, ResponseBody: body, ResponseHeaders: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"1"}}})

@@ -25,6 +25,7 @@ https://raw.githubusercontent.com/2Wgmqra4ZuDMex/cpa-account-queue/main/registry
 - 管理状态包含进程内脱敏诊断：累计接纳/完成/取消/超时/队列满计数，以及最近 256 条生命周期事件；不记录请求正文、密钥或原始账号/请求 ID。
 - 诊断事件同时异步追加到 state 目录的 `diagnostics.jsonl`，单文件 20 MiB、最多保留 5 个轮转文件；写入失败不会阻塞请求调度。
 - 固定账号满载行为可配置为 `queue`（默认，继续在固定账号排队）或 `fallback`（尝试其他可用候选账号）；回退只影响账号选择，不改变单账号并发上限。
+- fallback 同时覆盖 scheduler 选择阶段和后续 `request.intercept_after` admission 阶段；插件会复用 CPA 在 scheduler 阶段提供的候选账号集合。
 - 账号名称旁显示 CPA 凭据平台标签（例如 Antigravity、Claude、Kimi）；同邮箱账号可按平台区分，缺少平台元数据时显示“未知平台”，不按邮箱或模型名猜测。
 - 静态公开资源不包含账号信息；管理 API 由 CPA 管理鉴权保护。
 - 管理密钥默认仅在页面内存；可勾选“记住本次会话”使用 sessionStorage，刷新后自动连接；清除密钥或鉴权失败会移除会话密钥，不使用 localStorage。
