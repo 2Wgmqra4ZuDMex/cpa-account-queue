@@ -104,6 +104,8 @@ CPA 在选择账号之前调用 `session.Enrich`，把会话标识写入 `canoni
 本机 WSL2，CPA 官方发布包 v8.0.62 和 v8.0.67（均校验 SHA256），假凭据、loopback 假上游。
 两个版本上 `scripts/host_tests.sh` 的 11 项全部通过；其中依赖时序的 5 项在 v8.0.67 上另外连续跑 6 轮（30 次）无失败。
 v8.0.62 与 v8.0.67 之间 `internal/pluginhost`、`sdk/pluginapi`、`sdk/pluginabi` 三个目录没有差异。
+发布后用 GitHub Release 上的安装包（SHA256 `6586153137dc57b89f4408d036c475d9144f592de232460148df5b2e1c5b6f48`，与其 `checksums.txt` 一致）
+在两个版本上重跑同样的 11 项，全部通过。
 
 ### 有请求时替换插件（`tests/host_upgrade.py`）
 
