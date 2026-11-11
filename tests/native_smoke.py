@@ -109,6 +109,10 @@ with tempfile.TemporaryDirectory() as tmp:
         call("plugin.register", lifecycle)
         assert not call("request.intercept_after", request(f"reload-{i}"))["Terminate"]
         call("request.complete", request(f"reload-{i}"))
+    # The diagnostics log is written in the background and the native shutdown
+    # callback does not wait for it. This call does, so nothing is written
+    # into the temporary directory while it is being removed.
+    call("plugin.shutdown", {})
     plugin.shutdown()
 assert not buffers
 print("Native ABI smoke passed: admission, FIFO wakeup, host account listing, 20 shutdown/reinit cycles")
