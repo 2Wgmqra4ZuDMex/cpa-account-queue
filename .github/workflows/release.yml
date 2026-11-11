@@ -23,12 +23,15 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cpa-account-queue.so ./cmd/plugin
           python3 tests/native_smoke.py dist/cpa-account-queue.so
-      - name: Browser acceptance
+      - name: Install browser for acceptance
+        timeout-minutes: 8
         run: |
           python3 -m venv /tmp/queue-ui-release
           /tmp/queue-ui-release/bin/pip install playwright==1.64.1
           /tmp/queue-ui-release/bin/playwright install --with-deps chromium
-          /tmp/queue-ui-release/bin/python tests/ui_browser.py
+      - name: Browser acceptance
+        timeout-minutes: 3
+        run: /tmp/queue-ui-release/bin/python tests/ui_browser.py
       - name: Package and validate tag
         run: |
           python3 scripts/package_release.py dist/cpa-account-queue.so dist/release
