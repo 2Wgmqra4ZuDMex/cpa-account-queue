@@ -71,6 +71,25 @@ with sync_playwright() as p:
     frame.locator('#save').click()
     expect(frame.locator('#draft-note')).to_contain_text('已保存')
     assert 'disable_session_affinity' not in config
+    # Selection is the plugin's by default and, while it is, adds nothing to
+    # the saved config. Handing it to the host disables the two settings that
+    # only apply to the plugin's own selection.
+    expect(frame.locator('#selection-mode')).to_have_value('plugin')
+    assert 'host_selection' not in config
+    frame.locator('#selection-mode').select_option('host')
+    expect(frame.locator('#pinned-full-behavior')).to_be_disabled()
+    expect(frame.locator('#session-affinity')).to_be_disabled()
+    frame.locator('#save').click()
+    expect(frame.locator('#draft-note')).to_contain_text('已保存')
+    assert config['host_selection'] is True
+    expect(frame.locator('#selection-mode')).to_have_value('host')
+    expect(frame.locator('#session-affinity')).to_be_disabled()
+    frame.locator('#selection-mode').select_option('plugin')
+    expect(frame.locator('#pinned-full-behavior')).to_be_enabled()
+    expect(frame.locator('#session-affinity')).to_be_enabled()
+    frame.locator('#save').click()
+    expect(frame.locator('#draft-note')).to_contain_text('已保存')
+    assert 'host_selection' not in config
     frame.locator('#interval').fill('1')
     frame.locator('#interval').press('Tab')
     frame.locator('input[aria-label="为 Account A 使用独立策略"]').check()

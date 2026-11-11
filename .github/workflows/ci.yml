@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Daily, so that a new CPA release that breaks the plugin shows up here
+    # before it shows up in production.
+    - cron: '17 21 * * *'
 
 permissions:
   contents: read
@@ -42,24 +46,63 @@ jobs:
           sha256sum dist/cpa-account-queue.so > dist/checksums.txt
       - name: Native ABI smoke test
         run: python3 tests/native_smoke.py dist/cpa-account-queue.so
-      - name: Download pinned CPA host and verify release checksum
-        run: |
-          mkdir -p host
-          curl -fL --retry 3 https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.62/CLIProxyAPI_8.0.62_linux_amd64.tar.gz -o host/CLIProxyAPI_8.0.62_linux_amd64.tar.gz
-          curl -fL --retry 3 https://github.com/router-for-me/CLIProxyAPI/releases/download/v8.0.62/checksums.txt -o host/checksums.txt
-          (cd host && grep 'CLIProxyAPI_8.0.62_linux_amd64.tar.gz$' checksums.txt | sha256sum -c -)
-          tar -xzf host/CLIProxyAPI_8.0.62_linux_amd64.tar.gz -C host
-      - name: Isolated pinned CPA integration
-        run: |
-          python3 -m venv /tmp/queue-integration-venv
-          /tmp/queue-integration-venv/bin/pip install PyYAML==6.0.3
-          host_binary="$(find host -maxdepth 2 -type f -iname 'cli*proxy*' ! -name '*.tar.gz' | head -n 1)"
-          /tmp/queue-integration-venv/bin/python tests/host_integration.py "$host_binary" dist/cpa-account-queue.so
-          /tmp/queue-integration-venv/bin/python tests/host_priority.py "$host_binary" dist/cpa-account-queue.so
-          /tmp/queue-integration-venv/bin/python tests/host_affinity.py "$host_binary" dist/cpa-account-queue.so
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cpa-account-queue-linux-amd64-dev
           path: |
             dist/cpa-account-queue.so
             dist/checksums.txt
+
+  # Real-host tests against the CPA releases the plugin is verified on.
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cpa: ['8.0.62', '8.0.67']
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build plugin and upgrade target
+        run: bash scripts/build_for_host_tests.sh dist
+      - name: Download the published 0.2.0-dev plugin
+        run: |
+          mkdir -p dist/published
+          curl -fsSL --retry 3 https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.2.0-dev/cpa-account-queue_0.2.0-dev_linux_amd64.zip -o dist/published/plugin.zip
+          echo '43cc686d4e6fcd0934da6c8a74c675adee868a73b44af8d67ddff1297a358b12  dist/published/plugin.zip' | sha256sum -c -
+          unzip -o -q dist/published/plugin.zip -d dist/published
+      - name: Host tests on CPA v${{ matrix.cpa }}
+        run: |
+          python3 -m venv /tmp/queue-integration-venv
+          /tmp/queue-integration-venv/bin/pip install PyYAML==6.0.3
+          host_binary="$(bash scripts/fetch_host.sh '${{ matrix.cpa }}' host)"
+          PYTHON=/tmp/queue-integration-venv/bin/python bash scripts/host_tests.sh "$host_binary" dist/cpa-account-queue.so dist/cpa-account-queue-upgrade-target.so dist/published/cpa-account-queue.so
+
+  # The same tests against whatever CPA released last. A failure here means a
+  # new CPA version changed something the plugin relies on.
+  host-latest:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build plugin and upgrade target
+        run: bash scripts/build_for_host_tests.sh dist
+      - name: Host tests on the latest CPA release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest="$(gh api repos/router-for-me/CLIProxyAPI/releases/latest --jq .tag_name)"
+          echo "Latest CPA release: $latest" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -m venv /tmp/queue-integration-venv
+          /tmp/queue-integration-venv/bin/pip install PyYAML==6.0.3
+          host_binary="$(bash scripts/fetch_host.sh "$latest" host)"
+          PYTHON=/tmp/queue-integration-venv/bin/python bash scripts/host_tests.sh "$host_binary" dist/cpa-account-queue.so dist/cpa-account-queue-upgrade-target.so

@@ -1,7 +1,7 @@
 # CPA Web 安装（开发预览）
 
-当前发布：`v0.2.0-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
-排队功能已在 v8.0.48、v8.0.49 和 v8.0.62 上测试；跨优先级调度和会话亲和只在 v8.0.62 上验证过。
+当前发布：`v0.2.1-dev`，Linux amd64。支持 schema 2 自定义插件源的 CPA；
+排队功能已在 v8.0.48、v8.0.49、v8.0.62 和 v8.0.67 上测试；跨优先级调度、会话亲和、CPA 自带选号和有请求时的升级在 v8.0.62 和 v8.0.67 上验证过。
 宿主不支持 `scheduler_across_priorities` 时 `fallback` 不会溢出，行为与 `queue` 相同；
 宿主不在调度请求中提供会话标识时，会话亲和不起作用（诊断中全部计为“无会话标识”）。不是官方商店收录项目。
 
@@ -20,13 +20,13 @@ plugins:
 仓库及 Release 公开，不需要 GitHub Token。
 
 进入 Web 插件商店，刷新，找到 **CPA Account Queue (Development Preview)**，
-确认来源及版本 `0.2.0-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
+确认来源及版本 `0.2.1-dev` 后点击安装。CPA 下载 ZIP 并校验清单中的 SHA256。
 此源使用 `direct` 固定版本下载，因此不依赖 GitHub 的 latest release（预发布不会自动成为 latest）。
 
 可改用固定版本源，避免 main 指向后续版本：
 
 ```text
-https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.2.0-dev/registry.json
+https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.2.1-dev/registry.json
 ```
 
 ## 首次启用
@@ -40,8 +40,14 @@ https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.2.0-dev
 - 首次只做小范围试用；生产真实 OAuth 身份及插件级启停仍有待验收。
 - 安装操作是否自动启用以 CPA 版本行为为准，请在空闲时安装并检查插件状态。
 
-不要在有在途请求时热替换。回退先停止新请求并等已有请求结束，再禁用新插件；
-不要通过盲目清零在途计数恢复服务。
+## 升级
+
+- 从 0.2.1-dev 或更新版本升级：可以在有请求时安装。有请求在执行时当前版本继续限流，插件页面会提示新版本尚未生效；
+  空闲时 CPA 的下一次配置重载或重启自动换成新版本，想立刻切换就关开一次插件开关。
+- 从 0.2.0-dev 或更早版本升级到 0.2.1-dev 的这一次没有上述保护：安装时如果有请求在执行，插件会变成未注册、不再限流。
+  安装后在 CPA 插件列表里确认状态，未注册就关开一次插件开关。
+
+回退先停止新请求并等已有请求结束，再禁用新插件；不要通过盲目清零在途计数恢复服务。
 
 ## 后续发布
 
@@ -63,5 +69,7 @@ https://github.com/2Wgmqra4ZuDMex/cpa-account-queue/releases/download/v0.2.0-dev
 0.1.9-dev 重做账号选择：取得全部优先级的候选账号，`fallback` 改为“最高优先级账号都满载时溢出到较低优先级账号”，`queue` 保持只用最高优先级；诊断事件改为 `no_free_account` / `priority_overflow`。0.1.4 至 0.1.8 的 `fallback` 在生产中从未生效。
 0.2.0-dev 增加插件内的会话亲和（默认开启，可在插件页面关闭）：同一会话优先回到上次使用的账号，原账号满载或不可用时改绑；同优先级的新会话分散到已绑定会话较少的账号。新增诊断计数 `affinity_kept` / `affinity_moved` / `affinity_new` / `affinity_none`。
 回退到 0.1.9-dev 或更早版本之前，先在插件页面重新勾选“会话亲和”并保存：关闭亲和时策略文件会多出 `disable_session_affinity` 字段，旧版本遇到未知字段会拒绝加载。
+0.2.1-dev 修复有请求时升级导致插件未注册的问题；新增选号方式开关（插件选号 / CPA 自带选号，默认插件选号）；诊断中记录会话改绑的原因（`affinity_moved_full` / `affinity_moved_paused` / `affinity_moved_not_offered`）以及排队期间是否有其他账号空出（`queued_other_free`）；插件页面显示运行中的版本。
+回退到 0.2.0-dev 或更早版本之前，先把选号方式改回“插件选号”并保存：选“CPA 自带选号”时策略文件会多出 `host_selection` 字段，旧版本同样会拒绝加载。
 勾选会话记忆后，密钥存于当前来源的 sessionStorage；同标签页刷新可恢复。
 浏览器“恢复会话”功能可能保留会话存储，离开共享设备时请点击“清除密钥”。

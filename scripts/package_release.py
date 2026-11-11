@@ -24,7 +24,7 @@ sha = hashlib.sha256(archive.read_bytes()).hexdigest()
 repo = 'https://github.com/2Wgmqra4ZuDMex/cpa-account-queue'
 registry = {'schema_version': 2, 'plugins': [{
     'id': 'cpa-account-queue', 'name': 'CPA Account Queue (Development Preview)',
-    'description': 'Local per-account concurrency and bounded FIFO queues. Development preview; drain requests before replacing. Linux amd64 only.',
+    'description': 'Local per-account concurrency and bounded FIFO queues. Development preview. Linux amd64 only.',
     'author': '2Wgmqra4ZuDMex', 'version': version, 'repository': repo,
     'homepage': repo, 'license': 'MIT', 'tags': ['concurrency', 'queue', 'local', 'preview'],
     'install': {'type': 'direct', 'artifacts': [{

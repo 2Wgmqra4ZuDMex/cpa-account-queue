@@ -24,6 +24,9 @@ type runtime struct {
 	config      admission.Config
 	statePath   string
 	configured  bool
+	// deferredAt is when the host last asked to replace this version while
+	// requests were still active.
+	deferredAt time.Time
 }
 
 var app = &runtime{}
@@ -158,6 +161,13 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 		if err := r.configure(raw); err != nil {
 			return nil, err
 		}
+		if method == "plugin.register" {
+			// A new attachment of this image: whatever replacement was
+			// pending has been settled by the host.
+			r.mu.Lock()
+			r.deferredAt = time.Time{}
+			r.mu.Unlock()
+		}
 		return ok(registration())
 	case "management.register":
 		return ok(managementRegistration())
@@ -188,9 +198,13 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 				candidates = append(candidates, admission.Candidate{ID: c.ID, Priority: c.Priority})
 			}
 		}
-		id, err := e.Choose(candidates, selectionID(in.Options.Metadata), sessionKey(in.Model, in.Options.Metadata))
+		id, handled, err := e.Pick(candidates, selectionID(in.Options.Metadata), sessionKey(in.Model, in.Options.Metadata))
 		if err != nil {
 			return nil, err
+		}
+		if !handled {
+			// The host then runs its own configured selector.
+			return ok(map[string]any{"Handled": false})
 		}
 		return ok(map[string]any{"Handled": true, "AuthID": id})
 	case "request.intercept_after":
@@ -227,9 +241,17 @@ func (r *runtime) handle(method string, raw []byte) ([]byte, error) {
 		}
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
+		// The host quiesces a version only to replace it. Refusing leaves
+		// this version serving; the host retries on its next config reload.
+		e.RecordEvent("replacement_requested", "host asked to replace this version")
 		if err := e.Drain(ctx); err != nil {
+			e.RecordEvent("replacement_deferred", "requests are active; this version keeps serving")
+			r.mu.Lock()
+			r.deferredAt = time.Now().UTC()
+			r.mu.Unlock()
 			return nil, err
 		}
+		e.RecordEvent("handed_over", "idle; requests pass unlimited until the host switches versions")
 		return ok(struct{}{})
 	case "plugin.shutdown":
 		e.RecordEvent("plugin_shutdown", "shutdown requested")
@@ -279,8 +301,12 @@ func (r *runtime) management(in managementInput) ([]byte, error) {
 		if r.diagnostics != nil {
 			diagnostics = r.diagnostics.status()
 		}
+		deferred := ""
+		if !r.deferredAt.IsZero() {
+			deferred = r.deferredAt.Format(time.RFC3339)
+		}
 		r.mu.Unlock()
-		return managementJSON(200, map[string]any{"version": pluginVersion, "authority": "local", "runtime": s, "diagnostics": diagnostics, "account_index": entries, "account_index_available": listErr == nil, "account_index_error": func() string {
+		return managementJSON(200, map[string]any{"version": pluginVersion, "authority": "local", "runtime": s, "replacement_deferred_at": deferred, "diagnostics": diagnostics, "account_index": entries, "account_index_available": listErr == nil, "account_index_error": func() string {
 			if listErr != nil {
 				return "CPA account listing unavailable; active and configured accounts remain visible"
 			}

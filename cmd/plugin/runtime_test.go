@@ -305,6 +305,150 @@ func TestProtocolAdmissionNeverSwitchesAccount(t *testing.T) {
 	r.handle("request.complete", requestJSON("second", "team"))
 }
 
+// The host quiesces a version only to replace it. With a request running the
+// plugin must refuse and stay exactly as it was, so that the host's rollback
+// (plugin.reconfigure on the old version) succeeds and nothing is rejected.
+func TestProtocolQuiesceUnderLoadKeepsThisVersionServing(t *testing.T) {
+	r := setupRuntime(t)
+	admit(t, r, "active", "team")
+	queued := make(chan []byte, 1)
+	go func() {
+		b, _ := r.handle("request.intercept_after", admitJSON("queued", "team", "queued"))
+		queued <- b
+	}()
+	waitRuntimeQueued(t, r, 1)
+
+	quiesce, _ := json.Marshal(lifecycleInput{DeadlineUnixNano: time.Now().Add(40 * time.Millisecond).UnixNano()})
+	_, err := r.handle("plugin.quiesce", quiesce)
+	if err == nil {
+		t.Fatal("quiesce succeeded with a request running")
+	}
+	var failure struct {
+		Error wireError `json:"error"`
+	}
+	if errDecode := json.Unmarshal(wireFailure(err), &failure); errDecode != nil || failure.Error.Code != "plugin_busy" {
+		t.Fatalf("quiesce failure = %s", wireFailure(err))
+	}
+	if s := r.engine.Snapshot(nil); s.Draining || s.Waiting != 1 || s.Counters.DrainingRejected != 0 {
+		t.Fatalf("refused quiesce disturbed the runtime: %+v", s)
+	}
+
+	// The host's rollback re-sends the configuration it registered with.
+	raw, _ := json.Marshal(lifecycleInput{SchemaVersion: 9, ConfigYAML: []byte("state_path: " + filepath.ToSlash(r.statePath) + "\ndefaults:\n  max_concurrency: 1\n  max_queue: 2\n  wait_timeout_ms: 1000\n")})
+	if _, err := r.handle("plugin.reconfigure", raw); err != nil {
+		t.Fatalf("rollback reconfigure failed: %v", err)
+	}
+	// A request arriving afterwards is picked and queued as usual.
+	if got := pick(t, r, "later"); got != "team" {
+		t.Fatalf("pick after rollback = %q", got)
+	}
+	later := make(chan []byte, 1)
+	go func() {
+		b, _ := r.handle("request.intercept_after", admitJSON("later", "team", "later"))
+		later <- b
+	}()
+	waitRuntimeQueued(t, r, 2)
+	r.handle("request.complete", requestJSON("active", "team"))
+	if decodeResult[interceptOutput](t, <-queued).Terminate {
+		t.Fatal("request queued across the refused quiesce was rejected")
+	}
+	r.handle("request.complete", requestJSON("queued", "team"))
+	if decodeResult[interceptOutput](t, <-later).Terminate {
+		t.Fatal("request arriving after the refused quiesce was rejected")
+	}
+	r.handle("request.complete", requestJSON("later", "team"))
+
+	type report struct {
+		Version    string `json:"version"`
+		DeferredAt string `json:"replacement_deferred_at"`
+		Runtime    struct {
+			RecentEvents []admission.Event `json:"recent_events"`
+		} `json:"runtime"`
+	}
+	read := func() report {
+		t.Helper()
+		b, err := r.management(managementInput{Method: http.MethodGet, Path: managementBase + "/status"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out report
+		if err := json.Unmarshal(decodeResult[managementOutput](t, b).Body, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	status := read()
+	kinds := map[string]int{}
+	for _, event := range status.Runtime.RecentEvents {
+		kinds[event.Kind]++
+	}
+	if status.DeferredAt == "" || kinds["replacement_requested"] != 1 || kinds["replacement_deferred"] != 1 || status.Version != pluginVersion {
+		t.Fatalf("deferred replacement not reported: at=%q events=%v version=%q", status.DeferredAt, kinds, status.Version)
+	}
+
+	// Idle now, so the host's next attempt goes through. When this image is
+	// attached again, no replacement is pending any more.
+	idle, _ := json.Marshal(lifecycleInput{DeadlineUnixNano: time.Now().Add(time.Second).UnixNano()})
+	if _, err := r.handle("plugin.quiesce", idle); err != nil {
+		t.Fatalf("quiesce while idle: %v", err)
+	}
+	if _, err := r.handle("plugin.register", raw); err != nil {
+		t.Fatalf("register after an idle quiesce: %v", err)
+	}
+	if status := read(); status.DeferredAt != "" {
+		t.Fatalf("pending replacement still reported after a new attachment: %q", status.DeferredAt)
+	}
+}
+
+func setHostSelection(t *testing.T, r *runtime, on bool) {
+	t.Helper()
+	c := r.config.Clone()
+	c.HostSelection = on
+	body, _ := json.Marshal(map[string]any{"revision": revision(r.config), "config": c})
+	b, err := r.management(managementInput{Method: http.MethodPut, Path: managementBase + "/policies", Body: body})
+	if err != nil || decodeResult[managementOutput](t, b).StatusCode != 200 {
+		t.Fatalf("save host selection: %v %s", err, b)
+	}
+}
+
+// With host selection the scheduler answer is "not handled", which makes the
+// host run its own selector; admission still limits the account it chose.
+func TestProtocolHostSelectionDeclinesPickButStillLimits(t *testing.T) {
+	r := setupRuntime(t)
+	setHostSelection(t, r, true)
+	raw := []byte(`{"Model":"m","Options":{"Metadata":{"selection_id":"one","canonical_session_id":"conversation"}},"Candidates":[{"ID":"team","Priority":0},{"ID":"prolite","Priority":-10}]}`)
+	b, err := r.handle("scheduler.pick", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decodeResult[map[string]any](t, b)
+	if handled, _ := out["Handled"].(bool); handled || len(out) != 1 {
+		t.Fatalf("pick answer = %v, want only Handled=false", out)
+	}
+	admit(t, r, "first", "team")
+	result := make(chan []byte, 1)
+	go func() {
+		b, _ := r.handle("request.intercept_after", admitJSON("second", "team", "two"))
+		result <- b
+	}()
+	waitRuntimeQueued(t, r, 1)
+	r.handle("request.complete", requestJSON("first", "team"))
+	if decodeResult[interceptOutput](t, <-result).Terminate {
+		t.Fatal("queued request rejected")
+	}
+	loaded, err := admission.Load(r.statePath, admission.DefaultConfig())
+	if err != nil || !loaded.HostSelection {
+		t.Fatalf("setting not persisted: %+v %v", loaded, err)
+	}
+	// Back to plugin selection: the pick is handled again (pick fails the
+	// test otherwise) and follows the plugin's own rules.
+	r.handle("request.complete", requestJSON("second", "team"))
+	setHostSelection(t, r, false)
+	if got := pick(t, r, "three"); got != "team" {
+		t.Fatalf("pick after switching back = %q, want the idle top tier account", got)
+	}
+}
+
 func TestMetadataOnlyRegistrationAndNoStreamInterceptor(t *testing.T) {
 	b, _ := ok(registration())
 	var env struct {
@@ -399,7 +543,7 @@ func TestPublicUIContainsNoLiveStateOrSavedSecrets(t *testing.T) {
 			t.Fatal(forbidden)
 		}
 	}
-	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "priority_overflow", "accountPlatform", "session-affinity", "affinity_kept"} {
+	for _, required := range []string{"X-Management-Key", "textContent", "revision", "保存策略", "诊断记录", "recent_events", "orphaned_complete", "日志：", "查看实时计数和最近事件", "priority_overflow", "accountPlatform", "session-affinity", "affinity_kept", "selection-mode", "host_selection", "affinity_moved_not_offered", "queued_other_free", "replacement_deferred_at", "handover_passed", "handed_over"} {
 		if !strings.Contains(string(out.Body), required) {
 			t.Fatal(required)
 		}

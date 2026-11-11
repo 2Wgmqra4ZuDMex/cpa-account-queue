@@ -22,6 +22,10 @@ type Config struct {
 	// DisableSessionAffinity is omitted while false so that a state file
 	// written with affinity on stays readable by versions that predate it.
 	DisableSessionAffinity bool `json:"disable_session_affinity,omitempty" yaml:"-"`
+	// HostSelection leaves account selection to the host's own selector; the
+	// plugin then only limits and queues on the account the host chose.
+	// Omitted while false, for the same reason.
+	HostSelection bool `json:"host_selection,omitempty" yaml:"-"`
 }
 
 func DefaultConfig() Config {

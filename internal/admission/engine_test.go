@@ -240,22 +240,135 @@ func TestRepeatedEmptyDrainResumeDoesNotLockOutFirstRequest(t *testing.T) {
 	}
 }
 
-func TestFailedDrainCannotBlindlyClearActiveAccounting(t *testing.T) {
+// A drain that cannot finish must cost nothing: the engine keeps its
+// accounting, keeps queueing and admitting, and can be reconfigured. This is
+// what lets the host fall back to the running version when it tries to
+// replace the plugin under load.
+func TestDrainThatTimesOutLeavesEngineServing(t *testing.T) {
 	e := engine(t, 1, 1, 1000)
 	mustAcquire(t, e, "active", "a")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	queued := make(chan error, 1)
+	go func() { queued <- e.Acquire(context.Background(), "queued", "a") }()
+	waitQueued(t, e, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := e.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatal(err)
+	if err := e.Drain(ctx); !errors.Is(err, ErrBusy) {
+		t.Fatalf("drain under load returned %v, want ErrBusy", err)
 	}
-	if err := e.Resume(); !errors.Is(err, ErrDraining) {
-		t.Fatal(err)
+	s := e.Snapshot(nil)
+	if s.Draining || s.Waiting != 1 || s.Accounts[0].InFlight != 1 || s.Counters.DrainingRejected != 0 {
+		t.Fatalf("failed drain disturbed the engine: %+v", s)
+	}
+	if err := e.Resume(); err != nil {
+		t.Fatalf("resume after a failed drain: %v", err)
+	}
+	// A request arriving after the failed drain is served on a free account.
+	mustAcquire(t, e, "later", "b")
+	e.Complete("active")
+	if err := <-queued; err != nil {
+		t.Fatalf("request queued across the failed drain: %v", err)
+	}
+}
+
+// Requests keep being admitted while a drain waits; none is turned away.
+func TestDrainAdmitsRequestsWhileItWaits(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	mustAcquire(t, e, "active", "a")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	drained := make(chan error, 1)
+	go func() { drained <- e.Drain(ctx) }()
+	time.Sleep(20 * time.Millisecond)
+	mustAcquire(t, e, "during", "b")
+	select {
+	case err := <-drained:
+		t.Fatalf("drain returned %v with requests active", err)
+	case <-time.After(30 * time.Millisecond):
 	}
 	e.Complete("active")
+	e.Complete("during")
+	if err := <-drained; err != nil {
+		t.Fatalf("drain of an idle engine: %v", err)
+	}
+	if s := e.Snapshot(nil); !s.HandedOver || s.Draining || s.Counters.DrainingRejected != 0 {
+		t.Fatalf("unexpected state after drain: %+v", s)
+	}
+}
+
+// Between a successful drain and the host switching to the replacement the
+// host still routes here. Those requests must run: the pick is left to the
+// host and admission lets them through without holding a slot, since their
+// completions will be reported to the replacement, not to this version.
+func TestHandedOverEngineLetsRequestsThroughUnaccounted(t *testing.T) {
+	e := engine(t, 1, 0, 1000)
+	if err := e.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if id, handled, err := e.Pick(peers, "sel", "s"); err != nil || handled || id != "" {
+		t.Fatalf("pick after handover = %q handled=%v err=%v, want it left to the host", id, handled, err)
+	}
+	// More than the limit of one, on one account, with no queue allowed.
+	for i := 0; i < 3; i++ {
+		if err := e.AcquirePicked(context.Background(), fmt.Sprintf("r%d", i), "a", ""); err != nil {
+			t.Fatalf("request %d after handover: %v", i, err)
+		}
+	}
+	s := e.Snapshot([]string{"a"})
+	if s.Accounts[0].InFlight != 0 || s.Waiting != 0 || s.Counters.HandoverPassed != 3 || s.Counters.Admitted != 0 || s.Counters.DrainingRejected != 0 {
+		t.Fatalf("handover requests were accounted or rejected: %+v", s)
+	}
+	// The host fell back to this version after all: it limits again, and
+	// holds nothing from the handover.
 	if err := e.Resume(); err != nil {
 		t.Fatal(err)
 	}
-	mustAcquire(t, e, "next", "a")
+	mustAcquire(t, e, "back", "a")
+	if err := e.Acquire(context.Background(), "over", "a"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("limit not enforced after resuming: %v", err)
+	}
+}
+
+// A shutdown is not a handover: nothing more is admitted.
+func TestShutdownStillRejects(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	e.BeginDrain()
+	if err := e.Acquire(context.Background(), "r", "a"); !errors.Is(err, ErrDraining) {
+		t.Fatalf("admission after shutdown returned %v", err)
+	}
+	if s := e.Snapshot(nil); !s.Draining || s.HandedOver || s.Counters.HandoverPassed != 0 {
+		t.Fatalf("unexpected state after shutdown: %+v", s)
+	}
+}
+
+// A pick whose admission has not arrived yet belongs to a request in flight
+// inside the host, so the drain waits for it instead of stranding it.
+func TestDrainWaitsForPickedRequest(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	mustChoose(t, e, peers, "sel", "a")
+	short, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShort()
+	if err := e.Drain(short); !errors.Is(err, ErrBusy) {
+		t.Fatalf("drain with a pending pick returned %v", err)
+	}
+	if err := e.AcquirePicked(context.Background(), "r", "a", "sel"); err != nil {
+		t.Fatalf("picked request rejected after the failed drain: %v", err)
+	}
+	e.Complete("r")
+	if err := e.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A pick that never turns into a request lapses and stops holding a drain.
+func TestDrainIgnoresLapsedPick(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	e.reservationTTL = 30 * time.Millisecond
+	mustChoose(t, e, peers, "abandoned", "a")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := e.Drain(ctx); err != nil {
+		t.Fatalf("drain did not finish once the pick lapsed: %v", err)
+	}
 }
 
 // tiers mirrors the production shape behind the 60 s 503s: one Team account
@@ -825,4 +938,193 @@ func TestDrainRejectsQueuedRequestsWithoutReleasingActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustAcquire(t, e, "new", "a")
+}
+
+func admissionDetails(e *Engine) []string {
+	var details []string
+	for _, event := range e.Snapshot(nil).RecentEvents {
+		if event.Kind == "admitted" || event.Kind == "enqueued" {
+			details = append(details, event.Kind+": "+event.Detail)
+		}
+	}
+	return details
+}
+
+// Every move of a session names what kept it off the account it was bound
+// to, so the diagnostics can tell a full account from a cooled-down one.
+func TestAffinityMoveReasonIsRecorded(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	if got := turn(t, e, peers, "r1", "s"); got != "a" {
+		t.Fatalf("session started on %q", got)
+	}
+	// Bound account still busy with the first turn.
+	if got := turn(t, e, peers, "r2", "s"); got != "b" {
+		t.Fatalf("second turn ran on %q", got)
+	}
+	e.Complete("r1")
+	e.Complete("r2")
+	// Bound account (now b) is not among the accounts the host offers.
+	if got := turn(t, e, peers[:1], "r3", "s"); got != "a" {
+		t.Fatalf("third turn ran on %q", got)
+	}
+	e.Complete("r3")
+	// Bound account (now a) is paused.
+	c := e.cfg.Clone()
+	c.Accounts["a"] = Policy{MaxConcurrency: 1, MaxQueue: 2, WaitTimeoutMS: 1000, Paused: true}
+	if err := e.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	if got := turn(t, e, peers, "r4", "s"); got != "b" {
+		t.Fatalf("fourth turn ran on %q", got)
+	}
+	got := e.Snapshot(nil).Counters
+	if got.AffinityMoved != 3 || got.AffinityMovedFull != 1 || got.AffinityMovedNotOffered != 1 || got.AffinityMovedPaused != 1 {
+		t.Fatalf("move reasons: %+v", got)
+	}
+	session := " session=" + tag("s")
+	want := []string{
+		"admitted: immediate; affinity=new" + session,
+		"admitted: immediate; affinity=moved reason=full" + session,
+		"admitted: immediate; affinity=moved reason=not_offered" + session,
+		"admitted: immediate; affinity=moved reason=paused" + session,
+	}
+	if details := admissionDetails(e); fmt.Sprint(details) != fmt.Sprint(want) {
+		t.Fatalf("details=%q\nwant   %q", details, want)
+	}
+}
+
+// A queued request is flagged, once, when another account it was offered
+// frees up while it is still waiting behind its own.
+func TestQueuedRequestNotesAnotherOfferedAccountFreeingUp(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	route(t, e, peers, "r1", "a")
+	route(t, e, peers, "r2", "b")
+	mustChoose(t, e, peers, "r3", "a")
+	done := make(chan error, 1)
+	go func() { done <- e.AcquirePicked(context.Background(), "r3", "a", "r3") }()
+	waitQueued(t, e, 1)
+	if c := e.Snapshot(nil).Counters; c.QueuedOtherFree != 0 {
+		t.Fatalf("flagged while every offered account was full: %+v", c)
+	}
+	e.Complete("r2")
+	if c := e.Snapshot(nil).Counters; c.QueuedOtherFree != 1 {
+		t.Fatalf("free offered account not noticed: %+v", c)
+	}
+	// Further changes do not count the same request again.
+	mustAcquire(t, e, "r4", "b")
+	e.Complete("r4")
+	e.Complete("r1")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if c := e.Snapshot(nil).Counters; c.QueuedOtherFree != 1 {
+		t.Fatalf("request counted more than once: %+v", c)
+	}
+	details := admissionDetails(e)
+	if want := "enqueued: waiting for account slot; affinity=none; other_free=0"; details[2] != want {
+		t.Fatalf("enqueue detail %q, want %q", details[2], want)
+	}
+	if last, want := details[len(details)-1], "admitted: released from queue; other_free=yes"; last != want {
+		t.Fatalf("release detail %q, want %q", last, want)
+	}
+}
+
+// With a single offered account there is nowhere else to go, so a wait
+// there is never reported as avoidable.
+func TestQueuedRequestWithOneOfferedAccountIsNotFlagged(t *testing.T) {
+	e := engine(t, 1, 2, 1000)
+	only := peers[:1]
+	route(t, e, only, "r1", "a")
+	mustAcquire(t, e, "elsewhere", "b")
+	mustChoose(t, e, only, "r2", "a")
+	done := make(chan error, 1)
+	go func() { done <- e.AcquirePicked(context.Background(), "r2", "a", "r2") }()
+	waitQueued(t, e, 1)
+	e.Complete("elsewhere")
+	e.Complete("r1")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if c := e.Snapshot(nil).Counters; c.QueuedOtherFree != 0 {
+		t.Fatalf("flagged with no alternative offered: %+v", c)
+	}
+	details := admissionDetails(e)
+	if last, want := details[len(details)-1], "admitted: released from queue; other_free=no"; last != want {
+		t.Fatalf("release detail %q, want %q", last, want)
+	}
+}
+
+// With host selection the plugin declines every pick, keeps no bindings or
+// reservations, and still enforces the limit on whichever account arrives.
+func TestHostSelectionLeavesThePickToTheHost(t *testing.T) {
+	c := DefaultConfig()
+	c.Defaults = Policy{MaxConcurrency: 1, MaxQueue: 2, WaitTimeoutMS: 1000}
+	c.HostSelection = true
+	e, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		id, handled, err := e.Pick(peers, fmt.Sprintf("sel%d", i), "s")
+		if err != nil || handled || id != "" {
+			t.Fatalf("pick = %q handled=%v err=%v, want it left to the host", id, handled, err)
+		}
+	}
+	e.mu.Lock()
+	sessions, reserved := len(e.sessions), len(e.reserved)
+	e.mu.Unlock()
+	got := e.Snapshot(nil).Counters
+	if sessions != 0 || reserved != 0 || got.HostPicks != 3 || got.AffinityNew+got.AffinityKept+got.AffinityMoved+got.AffinityNone != 0 {
+		t.Fatalf("sessions=%d reserved=%d counters=%+v", sessions, reserved, got)
+	}
+	// The host put both requests on the same account; the limit still holds.
+	if err := e.AcquirePicked(context.Background(), "r1", "a", "sel0"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.AcquirePicked(context.Background(), "r2", "a", "sel1") }()
+	waitQueued(t, e, 1)
+	// The other account the host offered is idle the whole time.
+	if c := e.Snapshot(nil).Counters; c.QueuedOtherFree != 1 {
+		t.Fatalf("wait behind a busy account with another idle not reported: %+v", c)
+	}
+	e.Complete("r1")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Switching to host selection forgets the plugin's own bindings and picks,
+// so switching back starts clean.
+func TestSwitchingToHostSelectionForgetsBindingsAndPicks(t *testing.T) {
+	e := engine(t, 2, 2, 1000)
+	turn(t, e, peers, "r1", "s")
+	e.Complete("r1")
+	if _, err := e.Choose(peers, "pending", ""); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	sessionsBefore, reservedBefore := len(e.sessions), len(e.reserved)
+	e.mu.Unlock()
+	if sessionsBefore != 1 || reservedBefore != 1 {
+		t.Fatalf("setup: sessions=%d reserved=%d, want one of each", sessionsBefore, reservedBefore)
+	}
+	c := e.cfg.Clone()
+	c.HostSelection = true
+	if err := e.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	sessions, reserved := len(e.sessions), len(e.reserved)
+	e.mu.Unlock()
+	if sessions != 0 || reserved != 0 {
+		t.Fatalf("kept after switching: sessions=%d reserved=%d", sessions, reserved)
+	}
+	c.HostSelection = false
+	if err := e.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	if id, handled, err := e.Pick(peers, "back", "s"); err != nil || !handled || id == "" {
+		t.Fatalf("pick after switching back = %q handled=%v err=%v", id, handled, err)
+	}
 }

@@ -28,6 +28,7 @@ var (
 	ErrCompleted   = &Error{"request_completed", "request already completed or canceled", 409}
 	ErrIdentity    = &Error{"invalid_request_identity", "request and selected account identifiers are required", 400}
 	ErrGlobalQueue = &Error{"global_queue_full", "plugin global waiting limit reached", 503}
+	ErrBusy        = &Error{"plugin_busy", "requests are still active; the plugin keeps serving", 503}
 )
 
 const maxWaiting = 1024
@@ -48,6 +49,9 @@ type Counters struct {
 	GlobalQueueFull  uint64 `json:"global_queue_full"`
 	PausedRejected   uint64 `json:"paused_rejected"`
 	DrainingRejected uint64 `json:"draining_rejected"`
+	// HandoverPassed counts requests let through, unlimited, between this
+	// version agreeing to be replaced and the host switching to the new one.
+	HandoverPassed   uint64 `json:"handover_passed"`
 	OrphanedComplete uint64 `json:"orphaned_complete"`
 	NoFreeAccount    uint64 `json:"no_free_account"`
 	PriorityOverflow uint64 `json:"priority_overflow"`
@@ -55,6 +59,16 @@ type Counters struct {
 	AffinityMoved    uint64 `json:"affinity_moved"`
 	AffinityNew      uint64 `json:"affinity_new"`
 	AffinityNone     uint64 `json:"affinity_none"`
+	// The three reasons split AffinityMoved by what kept the session off the
+	// account it was bound to.
+	AffinityMovedFull       uint64 `json:"affinity_moved_full"`
+	AffinityMovedPaused     uint64 `json:"affinity_moved_paused"`
+	AffinityMovedNotOffered uint64 `json:"affinity_moved_not_offered"`
+	// QueuedOtherFree counts queued requests that, at some point while they
+	// waited, could have run on another account offered with theirs.
+	QueuedOtherFree uint64 `json:"queued_other_free"`
+	// HostPicks counts selections left to the host's own selector.
+	HostPicks uint64 `json:"host_picks"`
 }
 
 // Event is a redacted lifecycle event retained in the in-memory ring buffer.
@@ -76,6 +90,10 @@ type request struct {
 	active             bool
 	err                error
 	queuedAt, deadline time.Time
+	// offered is the account set of the selection that led here; otherFree
+	// is set once another of those accounts had room while this one waited.
+	offered   []string
+	otherFree bool
 }
 
 type account struct {
@@ -118,8 +136,17 @@ type Engine struct {
 	// once the session has been idle for sessionTTL.
 	sessions   map[string]binding
 	sessionTTL time.Duration
-	waiting    int
-	draining   bool
+	// offered maps an account to the account set of the latest selection
+	// that included it. It only feeds the QueuedOtherFree diagnostic.
+	offered map[string][]string
+	waiting int
+	// draining is set when the plugin is shut down: nothing more is admitted.
+	draining bool
+	// handedOver is set when a Drain succeeds: the host is about to replace
+	// this version, which holds no request and from then on limits nothing.
+	// The host keeps routing to it until the replacement has loaded, and
+	// those requests must not fail.
+	handedOver bool
 	changed    chan struct{}
 }
 
@@ -127,10 +154,73 @@ func New(c Config) (*Engine, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, reserved: map[string]reservation{}, reservationTTL: 5 * time.Second, sessions: map[string]binding{}, sessionTTL: time.Hour, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
+	return &Engine{cfg: c.Clone(), accounts: map[string]*account{}, accountStats: map[string]*Counters{}, reserved: map[string]reservation{}, reservationTTL: 5 * time.Second, sessions: map[string]binding{}, sessionTTL: time.Hour, offered: map[string][]string{}, requests: map[string]*request{}, completed: map[string]time.Time{}, changed: make(chan struct{}), events: make([]Event, 0, maxEvents)}, nil
 }
 
-func (e *Engine) notifyLocked() { close(e.changed); e.changed = make(chan struct{}) }
+// notifyLocked follows every change of occupancy: it wakes Drain and, since
+// a slot may just have opened, re-checks the queued requests.
+func (e *Engine) notifyLocked() {
+	e.noteOtherFreeLocked()
+	close(e.changed)
+	e.changed = make(chan struct{})
+}
+
+// offerLocked remembers which accounts one selection was offered together.
+func (e *Engine) offerLocked(candidates []Candidate) {
+	if len(e.offered) > maxAccounts {
+		clear(e.offered)
+	}
+	ids := make([]string, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.ID
+	}
+	for _, id := range ids {
+		e.offered[id] = ids
+	}
+}
+
+// otherFreeLocked counts the accounts offered alongside accountID that could
+// take one more request right now.
+func (e *Engine) otherFreeLocked(accountID string, offered []string) int {
+	n := 0
+	for _, id := range offered {
+		if id == accountID {
+			continue
+		}
+		p := e.cfg.Policy(id)
+		if p.Paused {
+			continue
+		}
+		if a := e.accounts[id]; a == nil || (a.active < p.MaxConcurrency && len(a.queue) == 0) {
+			n++
+		}
+	}
+	return n
+}
+
+// noteOtherFreeLocked flags each queued request, once, when another account
+// it was offered has room.
+func (e *Engine) noteOtherFreeLocked() {
+	if e.waiting == 0 {
+		return
+	}
+	for _, a := range e.accounts {
+		for _, r := range a.queue {
+			if !r.otherFree && e.otherFreeLocked(r.account, r.offered) > 0 {
+				r.otherFree = true
+				e.counters.QueuedOtherFree++
+				e.statsLocked(r.account).QueuedOtherFree++
+			}
+		}
+	}
+}
+
+func otherFreeNote(r *request) string {
+	if r.otherFree {
+		return "; other_free=yes"
+	}
+	return "; other_free=no"
+}
 
 // SetEventSink installs a non-blocking observer for lifecycle events. The
 // callback runs while the engine lock is held and must never perform blocking
@@ -378,6 +468,13 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 		e.mu.Unlock()
 		return ErrCompleted
 	}
+	if e.handedOver {
+		// Not accounted: its completion will be reported to the replacement.
+		e.counters.HandoverPassed++
+		e.recordLocked("handover_passed", id, accountID, 0, "replacement is loading; request not limited by this version")
+		e.mu.Unlock()
+		return nil
+	}
 	if e.draining {
 		e.counters.DrainingRejected++
 		e.statsLocked(accountID).DrainingRejected++
@@ -419,7 +516,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 		}
 		a := e.accountLocked(accountID)
 		e.dispatchLocked(accountID)
-		r = &request{id: id, account: accountID, ready: make(chan struct{}), queuedAt: now, deadline: now.Add(p.Wait())}
+		r = &request{id: id, account: accountID, ready: make(chan struct{}), queuedAt: now, deadline: now.Add(p.Wait()), offered: e.offered[accountID]}
 		if a.active < p.MaxConcurrency && len(a.queue) == 0 {
 			r.active = true
 			a.active++
@@ -451,7 +548,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 		e.requests[id] = r
 		e.counters.Enqueued++
 		e.statsLocked(accountID).Enqueued++
-		e.recordLocked("enqueued", id, accountID, 0, "waiting for account slot"+note)
+		e.recordLocked("enqueued", id, accountID, 0, fmt.Sprintf("waiting for account slot%s; other_free=%d", note, e.otherFreeLocked(accountID, r.offered)))
 		e.notifyLocked()
 	}
 	deadline := r.deadline
@@ -486,7 +583,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 			} else if errors.Is(waitErr, ErrTimeout) {
 				e.counters.TimedOut++
 				e.statsLocked(accountID).TimedOut++
-				e.recordLocked(ErrTimeout.Code, id, accountID, time.Since(r.queuedAt).Milliseconds(), "wait timeout")
+				e.recordLocked(ErrTimeout.Code, id, accountID, time.Since(r.queuedAt).Milliseconds(), "wait timeout"+otherFreeNote(r))
 			}
 			select {
 			case <-r.ready:
@@ -503,7 +600,7 @@ func (e *Engine) AcquirePicked(ctx context.Context, id, accountID, selectionID s
 	}
 	e.counters.Admitted++
 	e.statsLocked(accountID).Admitted++
-	e.recordLocked("admitted", id, accountID, time.Since(r.queuedAt).Milliseconds(), "released from queue")
+	e.recordLocked("admitted", id, accountID, time.Since(r.queuedAt).Milliseconds(), "released from queue"+otherFreeNote(r))
 	return nil
 }
 
@@ -548,8 +645,11 @@ func (e *Engine) Update(c Config) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cfg = c.Clone()
-	if e.cfg.DisableSessionAffinity {
+	if e.cfg.DisableSessionAffinity || e.cfg.HostSelection {
 		clear(e.sessions)
+	}
+	if e.cfg.HostSelection {
+		clear(e.reserved)
 	}
 	for id := range e.accounts {
 		e.dispatchLocked(id)
@@ -567,6 +667,7 @@ func (e *Engine) Resume() error {
 		return ErrDraining
 	}
 	e.draining = false
+	e.handedOver = false
 	e.notifyLocked()
 	return nil
 }
@@ -581,20 +682,31 @@ func (e *Engine) BeginDrain() {
 	e.notifyLocked()
 }
 
+// Drain waits until nothing is admitted, queued or picked, and hands over in
+// that same instant (see handedOver). Until then the engine serves as usual,
+// so when ctx ends first the engine is left exactly as it was and ErrBusy is
+// returned: a replacement that cannot happen must not cost any request.
 func (e *Engine) Drain(ctx context.Context) error {
-	e.BeginDrain()
 	for {
 		e.mu.Lock()
-		n := len(e.requests)
-		ch := e.changed
-		e.mu.Unlock()
-		if n == 0 {
+		picked := len(e.reservedLocked(time.Now()))
+		if len(e.requests) == 0 && picked == 0 {
+			e.handedOver = true
+			e.notifyLocked()
+			e.mu.Unlock()
 			return nil
 		}
+		ch := e.changed
+		e.mu.Unlock()
+		// A pick whose request never arrives lapses without a notification.
+		poll := time.NewTimer(50 * time.Millisecond)
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			poll.Stop()
+			return ErrBusy
 		case <-ch:
+			poll.Stop()
+		case <-poll.C:
 		}
 	}
 }
@@ -611,6 +723,7 @@ type AccountSnapshot struct {
 
 type Snapshot struct {
 	Draining         bool              `json:"draining"`
+	HandedOver       bool              `json:"handed_over"`
 	Waiting          int               `json:"waiting"`
 	GlobalQueueLimit int               `json:"global_queue_limit"`
 	Accounts         []AccountSnapshot `json:"accounts"`
@@ -634,7 +747,7 @@ func (e *Engine) Snapshot(ids []string) Snapshot {
 	for id := range e.accountStats {
 		set[id] = true
 	}
-	out := Snapshot{Draining: e.draining, Waiting: e.waiting, GlobalQueueLimit: maxWaiting, Accounts: []AccountSnapshot{}, Counters: e.counters, RecentEvents: append([]Event(nil), e.events...)}
+	out := Snapshot{Draining: e.draining, HandedOver: e.handedOver, Waiting: e.waiting, GlobalQueueLimit: maxWaiting, Accounts: []AccountSnapshot{}, Counters: e.counters, RecentEvents: append([]Event(nil), e.events...)}
 	for id := range set {
 		s := AccountSnapshot{ID: id, Policy: e.cfg.Policy(id)}
 		_, s.Override = e.cfg.Accounts[id]
@@ -681,6 +794,7 @@ func (e *Engine) Choose(candidates []Candidate, selectionID, session string) (st
 	if e.draining {
 		return "", ErrDraining
 	}
+	e.offerLocked(candidates)
 	overflow := e.cfg.PinnedFullBehavior == "fallback"
 	top := 0
 	for i, c := range candidates {
@@ -698,8 +812,12 @@ func (e *Engine) Choose(candidates []Candidate, selectionID, session string) (st
 		bound = e.sessions[session].account
 	}
 	best, bestFree, bestScore, considered := Candidate{}, false, 0, 0
+	boundOffered, boundPaused := false, false
 	for _, c := range candidates {
 		p := e.cfg.Policy(c.ID)
+		if c.ID == bound {
+			boundOffered, boundPaused = true, p.Paused
+		}
 		if p.Paused {
 			continue
 		}
@@ -764,8 +882,21 @@ func (e *Engine) Choose(candidates []Candidate, selectionID, session string) (st
 			e.counters.AffinityKept++
 			note = "; affinity=kept session=" + tag(session)
 		default:
+			// A bound account that is offered and not paused would have been
+			// kept had it had room, so what remains is that it was full.
 			e.counters.AffinityMoved++
-			note = "; affinity=moved session=" + tag(session)
+			reason := "full"
+			switch {
+			case !boundOffered:
+				reason = "not_offered"
+				e.counters.AffinityMovedNotOffered++
+			case boundPaused:
+				reason = "paused"
+				e.counters.AffinityMovedPaused++
+			default:
+				e.counters.AffinityMovedFull++
+			}
+			note = "; affinity=moved reason=" + reason + " session=" + tag(session)
 		}
 		if session != "" {
 			e.bindLocked(session, best.ID, now)
@@ -784,6 +915,27 @@ func (e *Engine) Choose(candidates []Candidate, selectionID, session string) (st
 		e.recordLocked("priority_overflow", "", best.ID, 0, "higher priority accounts are full or paused; "+detail)
 	}
 	return best.ID, nil
+}
+
+// Pick answers one host selection. With host selection configured it leaves
+// the choice to the host's own selector (handled is false) and only notes
+// which accounts were on offer; a version that has handed over leaves the
+// choice to the host too. Otherwise it is Choose.
+func (e *Engine) Pick(candidates []Candidate, selectionID, session string) (id string, handled bool, err error) {
+	e.mu.Lock()
+	if e.handedOver {
+		e.mu.Unlock()
+		return "", false, nil
+	}
+	if e.cfg.HostSelection {
+		e.offerLocked(candidates)
+		e.counters.HostPicks++
+		e.mu.Unlock()
+		return "", false, nil
+	}
+	e.mu.Unlock()
+	id, err = e.Choose(candidates, selectionID, session)
+	return id, err == nil, err
 }
 
 func AsError(err error) *Error {
