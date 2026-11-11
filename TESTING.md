@@ -145,6 +145,8 @@ v8.0.62 与 v8.0.67 之间 `internal/pluginhost`、`sdk/pluginapi`、`sdk/plugin
   已选号未接纳的请求会让 drain 等待；交接后的请求放行且不记账，回退后重新限流；三种改绑原因；排队请求只标记一次；
   `host_selection` 不建立绑定和预留，切换时清空。
 - 浏览器测试覆盖选号方式开关：切到 CPA 自带选号后两项插件选号设置变灰，保存的配置多出 `host_selection`，切回后该字段消失。
+  这项测试自本版本起只在本地运行（WSL2，Playwright + Chromium），不再由 GitHub Actions 或发布工作流运行：
+  CI 机器安装浏览器的系统依赖时连续两次失败（第一次是解析不了 Ubuntu 软件源的域名，第二次超时），测试本身没有运行到。
 
 未覆盖：真实 OAuth 凭据和真实 Codex 上游的额度耗尽响应；真实客户端（OpenCode、Codex、Claude Code）在“CPA 自带选号”下的压缩和子代理；
 经 CPA 商店页面的安装流程（测试用管理接口写入版本号并触发重载，与商店安装走同一个重载路径，但没有点商店按钮）。

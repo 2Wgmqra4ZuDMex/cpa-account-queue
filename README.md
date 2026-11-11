@@ -89,6 +89,15 @@ bash scripts/host_tests.sh "$host" dist/cpa-account-queue.so dist/cpa-account-qu
 每天还会用 CPA 的最新发布版跑一遍同样的测试（`host-latest`），新版本改变了插件依赖的行为时当天失败。
 这些测试使用假凭据和 loopback 假上游，不调用真实模型、不读取生产凭证。
 
+管理页面的浏览器测试不在 GitHub Actions 里运行（在 CI 机器上安装浏览器多次因下载系统包失败），改为每次发布前在本地运行：
+
+```sh
+pip install playwright==1.64.1 && playwright install chromium
+python tests/ui_browser.py
+```
+
+页面改动没有经过这一步就不要发布。
+
 ## 配置示例（仅供隔离测试）
 
 ```yaml
